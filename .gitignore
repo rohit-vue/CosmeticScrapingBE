@@ -1,0 +1,17 @@
+.tradewheel_auth_profile/
+venv/
+.env
+*.csv
+runs/
+# Python bytecode
+__pycache__/
+server/__pycache__/
+*.pyc
+
+# Lock files
+~*.lock*
+.~lock.*
+
+# OS files
+.DS_Store
+Thumbs.db
