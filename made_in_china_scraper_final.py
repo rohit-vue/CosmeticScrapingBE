@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
+from scraper_runtime_config import env_int, env_list
 
 try:
     from scrapling import StealthFetcher as ScraplingStealthFetcher
@@ -126,6 +127,13 @@ DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
 }
+
+KEYWORDS = env_list("SCRAPER_KEYWORDS", KEYWORDS)
+COUNTRIES = env_list("SCRAPER_COUNTRIES", COUNTRIES)
+DEFAULT_COUNTRY = COUNTRIES[0] if COUNTRIES else DEFAULT_COUNTRY
+TARGET_SUPPLIERS = env_int("SCRAPER_TARGET_SUPPLIERS", TARGET_SUPPLIERS)
+MAX_CONTACT_ENRICHMENTS = TARGET_SUPPLIERS
+MAX_WEBSITE_EMAIL_LOOKUPS = TARGET_SUPPLIERS
 
 JUNK_EMAIL_PHRASES = [
     "cloudflare", "404", "notfound", "blocked", "error",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import subprocess
 import sys
 import threading
@@ -94,7 +95,17 @@ class RunManager:
                 return self.active_run
             return None
 
-    def start_run(self, scraper_ids: list[str]) -> str:
+    def start_run(
+        self,
+        scraper_ids: list[str],
+        *,
+        keywords: list[str] | None = None,
+        countries: list[str] | None = None,
+        target_suppliers: int | None = None,
+    ) -> str:
+        run_keywords = self._clean_list(keywords)
+        run_countries = self._clean_list(countries)
+        run_target = target_suppliers if target_suppliers and target_suppliers > 0 else None
         with self._lock:
             if self.active_run and self.active_run.status == "running":
                 raise RuntimeError("A run is already in progress.")
@@ -102,11 +113,29 @@ class RunManager:
             if not ids:
                 raise RuntimeError("No valid scraper ids provided.")
             run_id = str(uuid4())
-            self.active_run = RunRecord(run_id=run_id, scraper_ids=ids, started_at=utc_now_iso())
+            self.active_run = RunRecord(
+                run_id=run_id,
+                scraper_ids=ids,
+                started_at=utc_now_iso(),
+                keywords=run_keywords,
+                countries=run_countries,
+                target_suppliers=run_target,
+            )
             for sid in ids:
+                if run_keywords:
+                    self.states[sid].keywords = list(run_keywords)
+                if run_countries:
+                    self.states[sid].countries = list(run_countries)
                 self.states[sid].status = "queued"
                 self.states[sid].progress = 0
-            self._executor.submit(self._execute_run, run_id, ids)
+            self._executor.submit(
+                self._execute_run,
+                run_id,
+                ids,
+                run_keywords,
+                run_countries,
+                run_target,
+            )
             return run_id
 
     def stop_run(self, run_id: str, scraper_ids: list[str] | None = None) -> None:
@@ -131,7 +160,14 @@ class RunManager:
                 "scrapers": [self._state_to_payload(s) for s in self.states.values()],
             }
 
-    def _execute_run(self, run_id: str, scraper_ids: list[str]) -> None:
+    def _execute_run(
+        self,
+        run_id: str,
+        scraper_ids: list[str],
+        keywords: list[str] | None = None,
+        countries: list[str] | None = None,
+        target_suppliers: int | None = None,
+    ) -> None:
         root = Path(__file__).resolve().parent.parent
         output_dir = run_dir(run_id)
         failures = 0
@@ -149,7 +185,7 @@ class RunManager:
                 self.states[scraper_id].status = "running"
                 self.states[scraper_id].progress = 5
 
-            # Use same interpreter as the API process (venv) — not bare "python" on PATH.
+            # Use same interpreter as the API process (venv), not bare "python" on PATH.
             # `-X utf8` forces UTF-8 mode for stdio so scrapers can print Unicode (e.g. arrows, accents)
             # on Windows consoles that default to cp1252.
             cmd = [sys.executable, "-X", "utf8", "-u", scraper.script_file]
@@ -160,6 +196,15 @@ class RunManager:
                 "PYTHONUTF8": "1",
                 "PYTHONUNBUFFERED": "1",
             }
+            if keywords:
+                child_env["SCRAPER_KEYWORDS"] = json.dumps(keywords, ensure_ascii=True)
+                self.logs.emit(run_id, scraper_id, "info", f"Using manual keywords: {', '.join(keywords)}")
+            if countries:
+                child_env["SCRAPER_COUNTRIES"] = json.dumps(countries, ensure_ascii=True)
+                self.logs.emit(run_id, scraper_id, "info", f"Using manual countries: {', '.join(countries)}")
+            if target_suppliers:
+                child_env["SCRAPER_TARGET_SUPPLIERS"] = str(target_suppliers)
+                self.logs.emit(run_id, scraper_id, "info", f"Using manual target suppliers: {target_suppliers}")
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(root),
@@ -206,20 +251,11 @@ class RunManager:
                 self._active_procs.pop(scraper_id, None)
             elapsed = int((monotonic() - t0) * 1000)
 
-            output_path = output_dir / scraper.output_csv
-            src_path = root / scraper.output_csv
-            if src_path.exists():
-                src_path.replace(output_path)
-            part_src = root / scraper.partial_csv
-            if part_src.exists():
-                part_src.replace(output_dir / scraper.partial_csv)
-            # Discard any cleaned CSV the script may have written to the
-            # working directory — we rebuild it here from the raw output so
-            # every per-scraper cleaned CSV uses the same unified schema.
-            stale_clean = root / scraper.cleaned_csv
-            if stale_clean.exists():
-                stale_clean.unlink(missing_ok=True)
-
+            for artifact_name in scraper.csv_artifacts:
+                artifact_src = root / artifact_name
+                if artifact_src.exists():
+                    artifact_src.replace(output_dir / artifact_name)
+            # Rebuild cleaned CSV in the run folder so every scraper uses a unified schema.
             cleaned_path: Path | None = None
             cleaned_count: int | None = None
             try:
@@ -267,7 +303,7 @@ class RunManager:
                     )
                 self.logs.emit(run_id, scraper_id, "error", f"{scraper.name} failed with code {code}")
 
-            # Update state and last/recent_runs atomically here — this way the
+            # Update state and last/recent_runs atomically here so the
             # frontend sees a consistent terminal status + records_found in the
             # very same SSE snapshot, which is what the auto-download watcher
             # needs to fire once-per-scraper-finish.
@@ -314,9 +350,19 @@ class RunManager:
                         "started_at": self.active_run.started_at,
                         "ended_at": self.active_run.ended_at,
                         "scraper_ids": scraper_ids,
+                        "keywords": keywords,
+                        "countries": countries,
+                        "target_suppliers": target_suppliers,
                         "combined_csv": str(combined),
                     },
                 )
+
+    @staticmethod
+    def _clean_list(values: list[str] | None) -> list[str] | None:
+        if not values:
+            return None
+        cleaned = [str(v).strip() for v in values if str(v).strip()]
+        return cleaned or None
 
     @staticmethod
     def _copy_state(s: ScraperState) -> ScraperState:

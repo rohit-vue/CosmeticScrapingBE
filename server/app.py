@@ -43,7 +43,12 @@ def list_scrapers() -> list[dict[str, object]]:
 @app.post("/api/runs", response_model=StartRunResponse)
 def start_run(body: StartRunRequest) -> StartRunResponse:
     try:
-        run_id = manager.start_run(body.scraper_ids)
+        run_id = manager.start_run(
+            body.scraper_ids,
+            keywords=body.keywords,
+            countries=body.countries,
+            target_suppliers=body.target_suppliers,
+        )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return StartRunResponse(run_id=run_id)

@@ -53,6 +53,12 @@ def _normalize(df: pd.DataFrame, source_directory: str) -> pd.DataFrame:
     for col in ("company_name", "country", "website_url", "email", "profile_url"):
         out[col] = out[col].fillna("").astype(str).str.strip()
 
+    email_lower = out["email"].str.lower()
+    out = out[~email_lower.str.contains(
+        r"example\.com|nobody@|cloudflare|notfound|blocked|error|copyright",
+        regex=True,
+        na=False,
+    )]
     out = out[out["email"] != ""]
     out = out[out["company_name"] != ""]
 
@@ -65,9 +71,8 @@ def clean_scraper_csv(scraper_id: str, run_path: Path) -> Path | None:
     """Read the scraper's raw CSV from `run_path` and write a cleaned CSV
     (unified schema, email-required, deduped by company name).
 
-    Falls back to the scraper's autosaved `*_partial.csv` when the final raw
-    file is missing or empty (e.g. when the scraper crashed or was stopped
-    mid-run) so we never lose data the script already persisted to disk.
+    Checks every archived CSV artifact for that scraper so enrichment/checkpoint
+    files can be used when the phase-1 raw file has no emails yet.
 
     Returns the path to the cleaned CSV. The file is always written, even
     when there is nothing to clean — in that case it contains just headers.
@@ -75,12 +80,13 @@ def clean_scraper_csv(scraper_id: str, run_path: Path) -> Path | None:
     scraper: ScraperDef | None = SCRAPERS.get(scraper_id)
     if scraper is None:
         return None
-    raw = _read_raw(run_path / scraper.output_csv, scraper.default_sep)
-    if raw.empty:
-        partial = _read_raw(run_path / scraper.partial_csv, scraper.default_sep)
-        if not partial.empty:
-            raw = partial
-    cleaned = _normalize(raw, source_directory=scraper.id)
+    cleaned = _empty_cleaned()
+    for artifact_name in scraper.csv_artifacts:
+        raw = _read_raw(run_path / artifact_name, scraper.default_sep)
+        candidate = _normalize(raw, source_directory=scraper.id)
+        if not candidate.empty:
+            cleaned = candidate
+            break
     out_path = run_path / scraper.cleaned_csv
     cleaned.to_csv(out_path, index=False, encoding="utf-8-sig")
     return out_path

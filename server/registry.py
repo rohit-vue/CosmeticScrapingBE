@@ -15,6 +15,16 @@ class ScraperDef:
     default_sep: str
     keywords: list[str]
     countries: list[str]
+    archive_csvs: tuple[str, ...] = ()
+
+    @property
+    def csv_artifacts(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((
+            self.output_csv,
+            self.partial_csv,
+            self.cleaned_csv,
+            *self.archive_csvs,
+        )))
 
 
 SCRAPERS: dict[str, ScraperDef] = {
@@ -41,6 +51,10 @@ SCRAPERS: dict[str, ScraperDef] = {
         default_sep=",",
         keywords=["cosmetic packaging", "beauty packaging"],
         countries=["China", "South Korea", "Taiwan", "Japan", "Vietnam"],
+        archive_csvs=(
+            "kompass_suppliers_enriched.csv",
+            "kompass_suppliers_enrichment_checkpoint.csv",
+        ),
     ),
     "made_in_china": ScraperDef(
         id="made_in_china",
@@ -48,11 +62,12 @@ SCRAPERS: dict[str, ScraperDef] = {
         domain="made-in-china.com",
         script_file="made_in_china_scraper_final.py",
         output_csv="made_in_china_suppliers_phase1_raw.csv",
-        partial_csv="made_in_china_suppliers_phase1_partial.csv",
+        partial_csv="made_in_china_suppliers_partial_enrichment.csv",
         cleaned_csv="made_in_china_suppliers_cleaned.csv",
-        default_sep=",",
+        default_sep="\t",
         keywords=["cosmetic tubes", "cosmetic bottles", "airless pumps"],
         countries=["China"],
+        archive_csvs=("made_in_china_suppliers_partial_scrape.csv",),
     ),
     "ec21": ScraperDef(
         id="ec21",
@@ -60,11 +75,12 @@ SCRAPERS: dict[str, ScraperDef] = {
         domain="ec21.com",
         script_file="ec21_scraper_final.py",
         output_csv="ec21_suppliers_phase1_raw.csv",
-        partial_csv="ec21_suppliers_partial.csv",
+        partial_csv="ec21_suppliers_enrich_progress.csv",
         cleaned_csv="ec21_suppliers_cleaned.csv",
-        default_sep=",",
+        default_sep="\t",
         keywords=["cosmetic-packaging", "cosmetic-bottles", "cosmetic-tubes"],
         countries=["China", "South Korea", "Taiwan", "Japan", "Vietnam", "Thailand"],
+        archive_csvs=("ec21_suppliers_scrape_progress.csv",),
     ),
     "exportpages": ScraperDef(
         id="exportpages",
@@ -72,11 +88,11 @@ SCRAPERS: dict[str, ScraperDef] = {
         domain="exportpages.com",
         script_file="exportpages_scraper_final.py",
         output_csv="exportpages_suppliers_raw.csv",
-        partial_csv="exportpages_suppliers_partial.csv",
+        partial_csv="exportpages_suppliers_enrich_progress.csv",
         cleaned_csv="exportpages_suppliers_cleaned.csv",
         default_sep="\t",
         keywords=["category 142", "cosmetic packaging"],
         countries=["China", "South Korea", "Taiwan", "Japan", "Vietnam", "Thailand"],
+        archive_csvs=("exportpages_suppliers_scrape_progress.csv",),
     ),
 }
-

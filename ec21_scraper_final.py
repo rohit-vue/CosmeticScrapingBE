@@ -16,6 +16,7 @@ from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
+from scraper_runtime_config import env_int, env_list
 from scrapling import StealthyFetcher as ScraplingStealthFetcher
 
 # ===== CONFIGURATION =====
@@ -86,12 +87,26 @@ COUNTRIES = {
     "Hong Kong": "HK",
 }
 
+_DEFAULT_COUNTRIES = COUNTRIES
+_REQUESTED_COUNTRIES = env_list("SCRAPER_COUNTRIES", _DEFAULT_COUNTRIES.keys())
+COUNTRIES = {
+    name: _DEFAULT_COUNTRIES[name]
+    for name in _REQUESTED_COUNTRIES
+    if name in _DEFAULT_COUNTRIES
+} or dict(_DEFAULT_COUNTRIES)
+
 PACKAGING_KEYWORDS = [
     "packaging", "bottle", "jar", "tube", "container", "pump", "dispenser",
     "dropper", "sprayer", "closure", "cap", "airless", "lotion bottle",
     "cream jar", "serum bottle", "plastic bottle", "glass bottle",
     "cosmetic packaging", "packaging manufacturer", "packaging supplier",
 ]
+
+CATEGORIES = [
+    re.sub(r"[^a-z0-9]+", "-", value.strip().lower()).strip("-")
+    for value in env_list("SCRAPER_KEYWORDS", CATEGORIES)
+]
+TARGET_SUPPLIERS = env_int("SCRAPER_TARGET_SUPPLIERS", TARGET_SUPPLIERS)
 
 EXCLUDE_KEYWORDS = [
     "lipstick", "lip gloss", "mascara", "eyeliner", "eyeshadow", "foundation",

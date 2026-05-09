@@ -15,6 +15,7 @@ from typing import Optional
 
 import pandas as pd
 import requests
+from scraper_runtime_config import env_int, env_list
 
 from playwright.sync_api import sync_playwright
 
@@ -35,6 +36,20 @@ COUNTRIES = {
     "Vietnam": "232", "Thailand": "198", "Singapore": "173",
     "Malaysia": "127", "Hong Kong": "94",
 }
+
+_DEFAULT_COUNTRIES = COUNTRIES
+_REQUESTED_COUNTRIES = env_list("SCRAPER_COUNTRIES", _DEFAULT_COUNTRIES.keys())
+COUNTRIES = {
+    name: _DEFAULT_COUNTRIES[name]
+    for name in _REQUESTED_COUNTRIES
+    if name in _DEFAULT_COUNTRIES
+} or dict(_DEFAULT_COUNTRIES)
+_REQUESTED_CATEGORIES = env_list("SCRAPER_KEYWORDS", [CATEGORY])
+if _REQUESTED_CATEGORIES:
+    category_match = re.search(r"\d+", _REQUESTED_CATEGORIES[0])
+    if category_match:
+        CATEGORY = category_match.group(0)
+TARGET_SUPPLIERS = env_int("SCRAPER_TARGET_SUPPLIERS", TARGET_SUPPLIERS)
 
 WEBSITE_TIMEOUT = 15
 WEBSITE_EMAIL_WORKERS = 5

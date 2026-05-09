@@ -44,6 +44,9 @@ class RunRecord:
     run_id: str
     scraper_ids: list[str]
     started_at: str
+    keywords: list[str] | None = None
+    countries: list[str] | None = None
+    target_suppliers: int | None = None
     ended_at: str | None = None
     status: Literal["running", "succeeded", "failed", "stopped"] = "running"
     combined_csv: Path | None = None

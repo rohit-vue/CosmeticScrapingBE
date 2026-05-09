@@ -1,0 +1,11 @@
+2026/05/09-10:56:49.111 1ad8 Creating DB C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Local Storage\leveldb since it was missing.
+2026/05/09-10:56:49.272 1ad8 Reusing MANIFEST C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/05/09-11:00:54.436 15f4 Level-0 table #5: started
+2026/05/09-11:00:54.464 15f4 Level-0 table #5: 18571 bytes OK
+2026/05/09-11:00:54.483 15f4 Delete type=0 #3
+2026/05/09-11:03:46.357 15f4 Level-0 table #7: started
+2026/05/09-11:03:46.383 15f4 Level-0 table #7: 18067 bytes OK
+2026/05/09-11:03:46.390 15f4 Delete type=0 #4
+2026/05/09-11:07:32.350 15f4 Level-0 table #9: started
+2026/05/09-11:07:32.381 15f4 Level-0 table #9: 20170 bytes OK
+2026/05/09-11:07:32.401 15f4 Delete type=0 #6

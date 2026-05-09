@@ -2,7 +2,7 @@
 Kompass supplier scraper with integrated enrichment.
 ====================================================
 Phase 1: Collect supplier records for cosmetic packaging terms
-Phase 2: Enrich profile → website → email (footer-first with Playwright)
+Phase 2: Enrich profile → website → email (requests-based, footer-first)
 Output: Cleaned CSV with only email-enriched records
 
 Features:
@@ -11,7 +11,12 @@ Features:
 - Proxy support (Webshare)
 - Incremental checkpoint saves
 - Concurrent email enrichment from company websites
-- Footer-first email extraction using Playwright
+- Footer-first email extraction using requests (same as EC21/Made-in-China)
+
+FIX (2025-05): extract_external_website_from_profile now correctly reads
+plain-text https:// links from the "Discover more on our Website" section
+instead of the Kompass redirect anchor (which returned the same URL for
+every company).
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ import os
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from html import unescape
@@ -32,6 +37,7 @@ from urllib.parse import quote_plus, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 import pandas as pd
+import requests
 from proxy_service import (
     ProxyEndpoint,
     ProxyExhaustedError,
@@ -40,6 +46,7 @@ from proxy_service import (
     goto_with_rotation,
     script_proxy_enabled,
 )
+from scraper_runtime_config import env_int, env_list
 
 from scrapling.fetchers import StealthyFetcher
 
@@ -55,8 +62,8 @@ except ImportError:
 
 # ===== KEYWORDS & COUNTRIES =====
 KEYWORDS = [
-    # "cosmetic tubes",
-    # "cosmetic jars",
+    "cosmetic tubes",
+    "cosmetic jars",
     "plastic packaging",
     "glass packaging",
     "lotion pumps",
@@ -89,39 +96,28 @@ CLEANED_CSV = "kompass_suppliers_cleaned.csv"
 PARTIAL_OUTPUT_CSV = "kompass_suppliers_phase1_partial.csv"
 ENRICHED_CSV = "kompass_suppliers_enriched.csv"
 CHECKPOINT_CSV = "kompass_suppliers_enrichment_checkpoint.csv"
-TARGET_SUPPLIERS = 1500
+TARGET_SUPPLIERS = 5000
 AUTOSAVE_EVERY_NEW_RECORDS = 10
+AUTOSAVE_EVERY_NEW_EMAILS = 10
 PROFILE_ENRICH_DURING_SCRAPE = False
 ENABLE_PROFILE_WEBSITE_ENRICHMENT = True
 MAX_PROFILE_WEBSITE_LOOKUPS = TARGET_SUPPLIERS
 ENABLE_WEBSITE_EMAIL_ENRICHMENT = True
 MAX_WEBSITE_EMAIL_LOOKUPS = TARGET_SUPPLIERS
-WEBSITE_EMAIL_PATHS = ("", "/contact",
-    "/contact-us", 
-    "/contactus",
-    "/contact.html",
-    "/contact-us.html",
-    "/contactus.html",
-    "/about",
-    "/about-us",
-    "/about.html",
-    "/about-us.html",
-    "/contact/",
-    "/contact-us/",
-    "/contactus/",
-    "/about/",
-    "/about-us/",
-    "/contactinfo",
-    "/contact-info",
-    "/contact_info",
-    "/get-in-touch",
-    "/reach-us",
-    "/en/contact",
-    "/en/contact-us",)
+
+# ===== PHASE 2B: REQUEST-BASED EMAIL ENRICHMENT =====
+WEBSITE_TIMEOUT = 15
 WEBSITE_EMAIL_WORKERS = 10
-# Email extraction config
-WEBSITE_EMAIL_USE_PLAYWRIGHT_PAGE = True  # Use Playwright for footer-aware email extraction
-WEBSITE_EMAIL_PLAYWRIGHT_TIMEOUT = 30000  # 30s timeout for individual page loads
+
+CONTACT_PATHS = [
+    "", "/contact", "/contact-us", "/contactus", "/contact.html",
+    "/contact-us.html", "/contactus.html", "/about", "/about-us",
+    "/about.html", "/about-us.html", "/contact/", "/contact-us/",
+    "/contactus/", "/about/", "/about-us/", "/contactinfo",
+    "/contact-info", "/contact_info", "/get-in-touch", "/reach-us",
+    "/en/contact", "/en/contact-us",
+]
+
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -130,6 +126,13 @@ DEFAULT_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+JUNK_EMAIL_PHRASES = [
+    "cloudflare", "404", "notfound", "blocked", "error",
+    "ordercreditreport", "copyright", "@anytime", "@theforefront",
+    "@homeandabroad", "@thistime", "@www", "pleasefeel",
+]
+
 ENABLE_BROWSER_FALLBACK = True
 PLAYWRIGHT_HEADLESS = False
 PLAYWRIGHT_CHANNEL = (
@@ -137,7 +140,6 @@ PLAYWRIGHT_CHANNEL = (
     if "KOMPASS_PLAYWRIGHT_CHANNEL" in os.environ
     else "chrome"
 )
-# Phase 2A: Use Playwright for profile pages
 USE_PLAYWRIGHT_PROFILE = os.getenv("KOMPASS_P2_PROFILE_BROWSER", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
@@ -155,6 +157,12 @@ COUNTRY_CODES = {
     "Hong Kong": "HK",
 }
 
+KEYWORDS = env_list("SCRAPER_KEYWORDS", KEYWORDS)
+COUNTRIES = env_list("SCRAPER_COUNTRIES", COUNTRIES)
+TARGET_SUPPLIERS = env_int("SCRAPER_TARGET_SUPPLIERS", TARGET_SUPPLIERS)
+MAX_PROFILE_WEBSITE_LOOKUPS = TARGET_SUPPLIERS
+MAX_WEBSITE_EMAIL_LOOKUPS = TARGET_SUPPLIERS
+
 # Proxy configuration
 KOMPASS_USE_PROXY = script_proxy_enabled("kompass")
 KOMPASS_USE_WEBSHARE = os.getenv("KOMPASS_USE_WEBSHARE", "1").strip().lower() not in {
@@ -168,19 +176,34 @@ _KOMPASS_WEBSHARE_FETCH_LOGGED = False
 _KOMPASS_WEBSHARE_IP_LOGGED = False
 _KOMPASS_SCRAPLING_CONFIGURED = False
 
-# Domains to skip when extracting external website (Kompass/KSales sales properties, social, etc.)
+# Domains to skip when extracting external website
 BLOCKED_DOMAINS = (
-    "kompass.com", "ksales.ai", "facebook.com", "instagram.com",
-    "linkedin.com", "youtube.com", "wa.me", "twitter.com",
-    "tiktok.com", "pinterest.com",
+    # Kompass / platform
+    "kompass.com", "ksales.ai",
+    # Social
+    "facebook.com", "instagram.com", "linkedin.com", "youtube.com",
+    "wa.me", "twitter.com", "tiktok.com", "pinterest.com", "x.com",
+    # Analytics / CDN / ads — these caused the duplicate-URL bug via Priority-5
+    "google.com", "googletagmanager.com", "googlesyndication.com",
+    "googleadservices.com", "googleapis.com", "gstatic.com",
+    "doubleclick.net", "ggpht.com",
+    "cloudflare.com", "cloudflareinsights.com",
+    "jquery.com", "jsdelivr.net", "bootstrapcdn.com",
+    "unpkg.com", "cdnjs.cloudflare.com",
+    "axept.io", "axeptio.eu",
+    "cookiebot.com", "onetrust.com",
+    "hotjar.com", "mouseflow.com", "clarity.ms",
+    "hubspot.com", "hubspotusercontent.com",
+    "intercomcdn.com", "zendesk.com",
+    "smart-data-systems.com",
+    "w3.org", "schema.org", "opengraph.io",
 )
 
-# Emails to reject
 BLOCKED_EMAIL_TOKENS = [
-    "kompass.com", "alibaba.com", "made-in-china.com",
+    "kompass.com", "alibaba.com", "made-in-china.com", "example.com",
     "cloudflare", "404", "notfound", "blocked", "error",
     "copyright", "@anytime", "@theforefront", "@homeandabroad",
-    "@thistime",
+    "@thistime", "nobody@",
 ]
 
 PROXY_POOL = None
@@ -457,12 +480,10 @@ def is_plausible_external_website(url: str) -> bool:
 
 
 def is_blocked_platform_website_url(url: str) -> bool:
-    """True if this URL must not be crawled for supplier email (Kompass/KSales, social, etc.)."""
     return not is_plausible_external_website((url or "").strip())
 
 
 def clean_email(email: str) -> str:
-    """Clean email by removing trailing text/junk after domain."""
     if not email:
         return ""
     match = re.match(r'([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})([A-Z].*)?', email)
@@ -470,7 +491,6 @@ def clean_email(email: str) -> str:
 
 
 def is_useful_email(email: str) -> bool:
-    """Filter junk and platform emails."""
     if not email or len(email) > 80 or len(email) < 6:
         return False
     if ' ' in email or email.count('@') != 1:
@@ -480,31 +500,9 @@ def is_useful_email(email: str) -> bool:
     low = email.lower()
     if any(b in low for b in BLOCKED_EMAIL_TOKENS):
         return False
+    if any(j in low for j in JUNK_EMAIL_PHRASES):
+        return False
     return True
-
-
-def extract_email_from_text_flexible(text: str) -> Optional[str]:
-    if not text:
-        return None
-    text = unescape(text)
-    mailto_match = re.search(
-        r"mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
-        text,
-        re.I,
-    )
-    if mailto_match:
-        return mailto_match.group(1)
-    normalized = re.sub(r"<[^>]+>", " ", text)
-    normalized = re.sub(r"\s*\(at\)\s*|\s*\[at\]\s*|\s+at\s+", "@", normalized, flags=re.I)
-    normalized = re.sub(
-        r"\s*\(dot\)\s*|\s*\[dot\]\s*|\s+dot\s+",
-        ".",
-        normalized,
-        flags=re.I,
-    )
-    normalized = re.sub(r"\s+", "", normalized)
-    match = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", normalized)
-    return match.group(0) if match else None
 
 
 def initialize_fetcher() -> Any:
@@ -548,6 +546,17 @@ def fetch_html(fetcher: Any, url: str, timeout: int = 40) -> tuple[int, str]:
     if hasattr(response, "text") and response.text:
         return int(status_code), response.text
     return int(status_code), str(response)
+
+
+def fetch_page_requests(url: str) -> Optional[str]:
+    """Fetch with requests for email enrichment phase. Returns HTML or None."""
+    try:
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=WEBSITE_TIMEOUT, allow_redirects=True)
+        if resp.status_code == 200:
+            return resp.text
+        return None
+    except Exception:
+        return None
 
 
 def fetch_html_simple(url: str, timeout: int = 30) -> tuple[int, str]:
@@ -763,56 +772,237 @@ def profile_playwright_page() -> Generator[Any, None, None]:
             pass
 
 
-def fetch_profile_html_playwright(page: Any, url: str) -> tuple[int, str]:
-    """Load a Kompass profile in the shared Playwright page."""
+def fetch_profile_html_playwright(page: Any, url: str) -> tuple[int, str, str]:
+    """
+    Load a Kompass profile in the shared Playwright page.
+
+    Returns (status, html, website_url) where website_url is extracted
+    directly from the live DOM — far more reliable than regex on raw HTML.
+
+    DOM extraction order:
+      A) Read all <a> hrefs inside the "Discover more on our Website" block
+         and the presentation section — these are plain anchor tags with the
+         real company URL.
+      B) JavaScript evaluation that walks every <a> in the page and returns
+         hrefs that look like real external company websites.
+      C) Falls back to raw HTML for regex parsing in extract_external_website_from_profile.
+    """
+    website_url = ""
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=PLAYWRIGHT_PROFILE_TIMEOUT_MS)
-        page.wait_for_timeout(600)
+        page.wait_for_timeout(1500)
+
+        # --- Cookie consent ---
+        cookie_selectors = [
+            "button:has-text('Continue without consent')",
+            "button:has-text('Continue without accepting')",
+            "button#axeptio_btn_acceptAll",
+            "button#axeptio_btn_acceptAllAndContinue",
+            "button:has-text('Accept all')",
+            "button:has-text('I accept')",
+            "button:has-text('Accept')",
+            "button:has-text('Let me choose')",
+        ]
+
+        cookie_handled = False
+        for selector in cookie_selectors:
+            try:
+                btn = page.locator(selector).first
+                if btn.count() > 0 and btn.is_visible(timeout=2000):
+                    btn.click(timeout=3000)
+                    page.wait_for_timeout(800)
+                    print(f"    [COOKIE] Handled: {selector}")
+                    cookie_handled = True
+                    break
+            except Exception:
+                continue
+
+        if not cookie_handled:
+            try:
+                frames = page.frames
+                for frame in frames:
+                    for selector in cookie_selectors:
+                        try:
+                            btn = frame.locator(selector).first
+                            if btn.count() > 0 and btn.is_visible(timeout=1500):
+                                btn.click(timeout=3000)
+                                page.wait_for_timeout(800)
+                                print(f"    [COOKIE] Handled in iframe: {selector}")
+                                cookie_handled = True
+                                break
+                        except Exception:
+                            continue
+                    if cookie_handled:
+                        break
+            except Exception:
+                pass
+
+        # --- Modal / popup close ---
+        modal_handled = False
+        modal_selectors = [
+            "button.close[data-dismiss='modal']",
+            ".modal-header button.close",
+            ".modal-header .close",
+            "button[aria-label='Close']",
+            "button:has-text('Close')",
+            "button:has-text('×')",
+            ".modal .close",
+            "[data-dismiss='modal']",
+        ]
+
+        for selector in modal_selectors:
+            try:
+                close_btn = page.locator(selector).first
+                if close_btn.count() > 0 and close_btn.is_visible(timeout=1500):
+                    close_btn.click(timeout=2500)
+                    page.wait_for_timeout(400)
+                    print(f"    [MODAL] Closed via: {selector}")
+                    modal_handled = True
+                    break
+            except Exception:
+                continue
+
+        if not modal_handled:
+            try:
+                backdrop = page.locator('.modal-backdrop, .modal.show, [role="dialog"]').first
+                if backdrop.count() > 0 and backdrop.is_visible(timeout=1000):
+                    page.keyboard.press("Escape")
+                    page.wait_for_timeout(500)
+                    print("    [MODAL] Dismissed via Escape key")
+                    modal_handled = True
+            except Exception:
+                pass
+
+        if not modal_handled:
+            try:
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+            except Exception:
+                pass
+
+        # --- Scroll to trigger lazy-loaded content ---
+        try:
+            for _ in range(3):
+                page.mouse.wheel(0, 1500)
+                page.wait_for_timeout(400)
+            page.evaluate("window.scrollTo(0, 0)")
+        except Exception:
+            pass
+
+        # --- Wait for About Us / website section to render ---
+        page.wait_for_timeout(2000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+
+        # ----------------------------------------------------------------
+        # DIRECT DOM EXTRACTION — most reliable approach.
+        # We use JavaScript to walk the live DOM and collect every <a href>
+        # that points to a real external company website.
+        # Blocked domains are passed in so the JS can filter them out.
+        # ----------------------------------------------------------------
+        blocked_js = list(BLOCKED_DOMAINS)
+        try:
+            website_url = page.evaluate(
+                """(blockedDomains) => {
+                    function isBlocked(href) {
+                        if (!href || !href.startsWith('http')) return true;
+                        try {
+                            var host = new URL(href).hostname.toLowerCase();
+                            return blockedDomains.some(function(d) {
+                                return host === d || host.endsWith('.' + d);
+                            });
+                        } catch(e) { return true; }
+                    }
+
+                    // Strategy A: links inside the "Discover more" / presentation block
+                    var presentationSelectors = [
+                        '[class*="presentation"]',
+                        '[id*="presentation"]',
+                        '[class*="about"]',
+                        '[class*="description"]',
+                        '[class*="website"]',
+                        '.trWebSite',
+                    ];
+                    for (var i = 0; i < presentationSelectors.length; i++) {
+                        var containers = document.querySelectorAll(presentationSelectors[i]);
+                        for (var j = 0; j < containers.length; j++) {
+                            var links = containers[j].querySelectorAll('a[href]');
+                            for (var k = 0; k < links.length; k++) {
+                                var href = links[k].getAttribute('href') || '';
+                                if (!isBlocked(href)) return href;
+                            }
+                            // Also check plain text URLs inside the container
+                            var text = containers[j].innerText || '';
+                            var match = text.match(/https?:\\/\\/[^\\s]{6,}/);
+                            if (match) {
+                                var candidate = match[0].replace(/[.,;)\\]]+$/, '');
+                                if (!isBlocked(candidate)) return candidate;
+                            }
+                        }
+                    }
+
+                    // Strategy B: the dedicated webSite_presentation anchor
+                    var wsAnchors = document.querySelectorAll('[id^="webSite_presentation_"]');
+                    for (var i = 0; i < wsAnchors.length; i++) {
+                        var href = wsAnchors[i].getAttribute('href') || '';
+                        // Skip Kompass relay URLs
+                        if (href && href.indexOf('mise-en-relation') === -1 && !isBlocked(href)) {
+                            return href;
+                        }
+                        // If it IS a relay, get the displayed text which is often the real URL
+                        var txt = (wsAnchors[i].innerText || '').trim();
+                        if (txt.startsWith('http') && !isBlocked(txt)) return txt;
+                        // Or look for a data attribute
+                        var dataUrl = wsAnchors[i].getAttribute('data-url')
+                                   || wsAnchors[i].getAttribute('data-href')
+                                   || wsAnchors[i].getAttribute('data-website');
+                        if (dataUrl && !isBlocked(dataUrl)) return dataUrl;
+                    }
+
+                    // Strategy C: Company website button (top of page)
+                    var btns = document.querySelectorAll('a.btn, a[class*="website"], a[href*="webSite"]');
+                    for (var i = 0; i < btns.length; i++) {
+                        var href = btns[i].getAttribute('href') || '';
+                        if (href && href.indexOf('mise-en-relation') === -1 && !isBlocked(href)) {
+                            return href;
+                        }
+                    }
+
+                    // Strategy D: Walk every <a> in page order, skip blocked
+                    var all = document.querySelectorAll('a[href]');
+                    for (var i = 0; i < all.length; i++) {
+                        var href = all[i].getAttribute('href') || '';
+                        if (href.startsWith('http') && href.indexOf('mise-en-relation') === -1 && !isBlocked(href)) {
+                            return href;
+                        }
+                    }
+
+                    return '';
+                }""",
+                blocked_js,
+            )
+            if website_url:
+                print(f"    [DOM-EXTRACT] Found via JS: {website_url[:70]}")
+        except Exception as exc:
+            print(f"    [DOM-EXTRACT] JS evaluation failed: {exc}")
+            website_url = ""
+
         html = page.content()
         if not html:
-            return 0, ""
-        return 200, html
+            return 0, "", ""
+        return 200, html, website_url or ""
+
     except PlaywrightTimeoutError:
         print(f"    [PLAYWRIGHT TIMEOUT] {url[:80]}")
-        return 0, ""
+        return 0, "", ""
     except Exception as exc:
         print(f"    [PLAYWRIGHT ERROR] {url[:80]} → {exc}")
-        return 0, ""
+        return 0, "", ""
 
 
 # ===== PHASE 2A: PROFILE → WEBSITE =====
-
-def extract_external_website_from_profile(profile_html: str) -> str:
-    """Extract external website URL from Kompass profile page HTML."""
-    # 1. Dedicated website row
-    row_match = re.search(
-        r'<tr[^>]*class=["\'][^"\']*\btrWebSite\b[^"\']*["\'][^>]*>(.*?)</tr>',
-        profile_html,
-        flags=re.I | re.S,
-    )
-    if row_match:
-        for href, _ in _extract_anchors(row_match.group(1)):
-            if is_plausible_external_website(href):
-                return href
-
-    # 2. Look for a clearly labelled website section
-    website_section = re.search(
-        r'(?:website|web site|www)[^<]{0,60}<[^>]*href=["\']([^"\']+)["\']',
-        profile_html,
-        flags=re.I,
-    )
-    if website_section:
-        href = normalize_url(website_section.group(1))
-        if is_plausible_external_website(href):
-            return href
-
-    # 3. Fallback: first plausible external link
-    for href, _ in _extract_anchors(profile_html):
-        if is_plausible_external_website(href):
-            return href
-
-    return ""
-
 
 def _extract_anchors(html: str) -> list[tuple[str, str]]:
     results = []
@@ -823,6 +1013,133 @@ def _extract_anchors(html: str) -> list[tuple[str, str]]:
     ):
         results.append((normalize_url(href.strip()), strip_tags(inner)))
     return results
+
+
+def extract_external_website_from_profile(profile_html: str) -> str:
+    """
+    Regex fallback for when Playwright DOM extraction returns nothing.
+
+    The key insight from the bug investigation:
+    - Kompass renders company websites as <a href="..."> anchors inside the
+      About Us / presentation block — NOT as plain text.
+    - The old regex used [^<]{0,300} which stopped at the first HTML tag,
+      so it never reached the href inside the <a>.
+    - Priority 5 (full-page URL scan) then fired and returned Google/CDN URLs.
+
+    Fixed strategy:
+    1.  Extract hrefs from <a> tags inside presentation/about/website sections.
+    2.  Extract hrefs from the webSite_presentation anchor (skip Kompass relays).
+    3.  Extract hrefs from the trWebSite table row.
+    4.  Plain-text URL scan of the whole page, with expanded blocked-domain list.
+    """
+
+    def _first_good_href(html_fragment: str) -> str:
+        """Return first external href from <a> tags in the fragment."""
+        for href, _ in _extract_anchors(html_fragment):
+            href = href.rstrip(".,;)")
+            if (
+                is_plausible_external_website(href)
+                and "mise-en-relation" not in href
+            ):
+                return href
+        return ""
+
+    # --- PRIORITY 1: <a> links inside presentation / about / website sections ---
+    # These CSS-class fragments contain the "Discover more on our Website" links.
+    section_patterns = [
+        r'(<(?:div|section|td)[^>]*class=["\'][^"\']*(?:presentation|about|website|description|contact)[^"\']*["\'][^>]*>.*?</(?:div|section|td)>)',
+        r'(<(?:div|section)[^>]*id=["\'][^"\']*(?:presentation|about|website)[^"\']*["\'][^>]*>.*?</(?:div|section)>)',
+    ]
+    for pattern in section_patterns:
+        for fragment in re.findall(pattern, profile_html, flags=re.I | re.S):
+            result = _first_good_href(fragment)
+            if result:
+                print(f"    [WEBSITE-EXTRACT] Priority-1 (section anchor): {result[:70]}")
+                return result
+
+    # --- PRIORITY 2: webSite_presentation_N anchor ---
+    # Extract href and also the inner text (which is sometimes the real URL).
+    for m in re.finditer(
+        r'<a[^>]*id="webSite_presentation_\d+"[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+        profile_html,
+        flags=re.I | re.S,
+    ):
+        href = m.group(1).strip().rstrip(".,;)")
+        inner_text = strip_tags(m.group(2)).strip().rstrip(".,;)")
+
+        # The inner text is often the actual company URL displayed to the user
+        for candidate in [inner_text, href]:
+            if not candidate:
+                continue
+            # Ensure it starts with http if it looks like a domain
+            if not candidate.startswith("http") and re.match(r'^www\.[a-z]', candidate, re.I):
+                candidate = "http://" + candidate
+            if (
+                candidate.startswith("http")
+                and "mise-en-relation" not in candidate
+                and is_plausible_external_website(candidate)
+            ):
+                print(f"    [WEBSITE-EXTRACT] Priority-2 (webSite anchor): {candidate[:70]}")
+                return candidate
+
+    # --- PRIORITY 3: trWebSite table row ---
+    row_match = re.search(
+        r'<tr[^>]*class=["\'][^"\']*\btrWebSite\b[^"\']*["\'][^>]*>(.*?)</tr>',
+        profile_html,
+        flags=re.I | re.S,
+    )
+    if row_match:
+        result = _first_good_href(row_match.group(1))
+        if result:
+            print(f"    [WEBSITE-EXTRACT] Priority-3 (trWebSite row): {result[:70]}")
+            return result
+
+    # --- PRIORITY 4: ALL <a href> anchors in page order, skip blocked ---
+    # Walk every anchor — more reliable than plain-text URL scanning.
+    for href, label in _extract_anchors(profile_html):
+        href = href.rstrip(".,;)")
+        if (
+            is_plausible_external_website(href)
+            and "mise-en-relation" not in href
+        ):
+            print(f"    [WEBSITE-EXTRACT] Priority-4 (all anchors): {href[:70]}")
+            return href
+
+    # --- PRIORITY 5: Plain-text URL scan (last resort, BLOCKED_DOMAINS guards CDNs) ---
+    all_urls = re.findall(r'https?://[^\s<"\'>\)\]]{6,}', profile_html)
+    for raw_url in all_urls:
+        u = raw_url.rstrip(".,;)")
+        if is_plausible_external_website(u) and "mise-en-relation" not in u:
+            print(f"    [WEBSITE-EXTRACT] Priority-5 (plain-text scan): {u[:70]}")
+            return u
+
+    print("    [WEBSITE-EXTRACT] No external website found.")
+    return ""
+
+
+def resolve_redirect_url(url: str) -> str:
+    """
+    Follow HTTP redirects to resolve the final destination URL.
+    Previously only handled 'mise-en-relation' URLs; now always resolves
+    so we catch any Kompass-style redirect regardless of path pattern.
+    """
+    if not url:
+        return url
+    try:
+        resp = requests.get(
+            url,
+            headers=DEFAULT_HEADERS,
+            timeout=15,
+            allow_redirects=True,
+        )
+        final_url = resp.url
+        if is_plausible_external_website(final_url):
+            if final_url != url:
+                print(f"    [REDIRECT] {url[:50]} → {final_url[:60]}")
+            return final_url
+    except Exception:
+        pass
+    return url
 
 
 def enrich_website_from_profile_rows(
@@ -871,10 +1188,11 @@ def enrich_website_from_profile_rows(
             print(f"  [{idx}/{total}] {row['company_name'][:55]:<55} ", end="", flush=True)
 
             if pw_page is not None:
-                status, html = fetch_profile_html_playwright(pw_page, profile_url)
+                status, html, dom_website = fetch_profile_html_playwright(pw_page, profile_url)
             else:
                 fetcher = initialize_fetcher()
                 status, html = fetch_html(fetcher, profile_url)
+                dom_website = ""
 
             if status != 200 or not html:
                 label = "browser" if pw_page is not None else "HTTP"
@@ -882,8 +1200,14 @@ def enrich_website_from_profile_rows(
                 random_delay(min_sec=2, max_sec=5)
                 continue
 
-            website = extract_external_website_from_profile(html)
+            # Prefer direct DOM extraction; fall back to regex on raw HTML
+            website = dom_website or extract_external_website_from_profile(html)
+
             if website:
+                # Always follow redirects — catches Kompass relay URLs
+                resolved = resolve_redirect_url(website)
+                if resolved and is_plausible_external_website(resolved):
+                    website = resolved
                 row["website_url"] = website
                 updated += 1
                 print(f"✓  {website[:60]}")
@@ -907,222 +1231,87 @@ def enrich_website_from_profile_rows(
     return rows
 
 
-# ===== PHASE 2B: WEBSITE → EMAIL (FOOTER-FIRST WITH PLAYWRIGHT) =====
+# ===== PHASE 2B: WEBSITE → EMAIL =====
 
-def _extract_email_from_page(page: Any) -> Optional[str]:
-    """Extract email from a fully loaded Playwright page."""
-    try:
-        html = page.content()
-        return extract_email_from_text_flexible(html)
-    except Exception:
+def extract_email_from_html(html: str) -> Optional[str]:
+    """Extract email from HTML — checks footer first, then full page."""
+    if not html:
         return None
+    text = unescape(html)
 
-
-def _fetch_email_for_row(row: dict) -> tuple[dict, str]:
-    """
-    Worker: visit company website with Playwright.
-    Priority:
-    1. Homepage footer → scroll to bottom, extract email from footer area
-    2. Contact pages (/, /contact, /contact-us, /about, /about-us)
-    """
-    if is_blocked_platform_website_url((row.get("website_url") or "").strip()):
-        return row, ""
-
-    if not WEBSITE_EMAIL_USE_PLAYWRIGHT_PAGE or sync_playwright is None:
-        # Fallback to simple HTTP if Playwright not available
-        base = row["website_url"].rstrip("/")
-        seen: set[str] = set()
-        for path in WEBSITE_EMAIL_PATHS:
-            url = f"{base}{path}" if path else base
-            if url in seen:
-                continue
-            seen.add(url)
-            _, html = fetch_html_simple(url, timeout=20)
-            if not html:
-                continue
-            email = extract_email_from_text_flexible(html)
+    footer_patterns = [
+        r'<footer[^>]*>(.*?)</footer>',
+        r'<div[^>]*class="[^"]*footer[^"]*"[^>]*>(.*?)</div>',
+        r'<div[^>]*id="[^"]*footer[^"]*"[^>]*>(.*?)</div>',
+        r'<div[^>]*class="[^"]*contact[^"]*"[^>]*>(.*?)</div>',
+    ]
+    for pattern in footer_patterns:
+        match = re.search(pattern, text, re.I | re.DOTALL)
+        if match:
+            email = _find_email_in_text(match.group(1))
             if email:
-                email = clean_email(email)
-                if is_useful_email(email):
-                    return row, email
-        return row, ""
+                return email
 
-    # Playwright-based footer-first extraction
-    pw = None
-    browser = None
-    try:
-        pw = sync_playwright().start()
-        launch_kwargs: dict[str, Any] = {
-            "headless": PLAYWRIGHT_HEADLESS,
-            "args": PLAYWRIGHT_ARGS,
-        }
-        if PLAYWRIGHT_CHANNEL:
-            launch_kwargs["channel"] = PLAYWRIGHT_CHANNEL
-        if KOMPASS_USE_PROXY and KOMPASS_USE_WEBSHARE:
-            launch_kwargs["proxy"] = _kompass_webshare_playwright_proxy()
+    return _find_email_in_text(text)
 
-        browser = pw.chromium.launch(**launch_kwargs)
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            user_agent=DEFAULT_HEADERS["User-Agent"],
-        )
-        page = context.new_page()
-        base = row["website_url"].rstrip("/")
-        seen_urls: set[str] = set()
 
-        # ============================================================
-        # STEP 1: Check homepage footer first
-        # ============================================================
-        try:
-            page.goto(base, wait_until="domcontentloaded", timeout=WEBSITE_EMAIL_PLAYWRIGHT_TIMEOUT)
-            page.wait_for_timeout(1500)
+def _find_email_in_text(text: str) -> Optional[str]:
+    """Find valid email in text."""
+    text_lower = text.lower()
 
-            # Scroll to the very bottom of the page to trigger lazy-loaded footers
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2000)
+    mailto = re.search(
+        r"mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})",
+        text_lower, re.I,
+    )
+    if mailto:
+        email = mailto.group(1)
+        if is_useful_email(email):
+            return email
 
-            # Try multiple footer-specific extraction strategies
-            footer_html_parts: list[str] = []
+    clean = re.sub(r"<[^>]+>", " ", text_lower)
+    for pat, rep in [
+        (r"\s*\(at\)\s*", "@"), (r"\s*\[at\]\s*", "@"),
+        (r"\s+at\s+", "@"), (r"\s*\(dot\)\s*", "."),
+        (r"\s*\[dot\]\s*", "."), (r"\s+dot\s+", "."),
+    ]:
+        clean = re.sub(pat, rep, clean, flags=re.I)
+    clean = re.sub(r"\s+", "", clean)
 
-            # Strategy A: Extract <footer> tag content
-            try:
-                footer_elements = page.locator("footer").all()
-                for el in footer_elements:
-                    try:
-                        html = el.inner_html()
-                        if html:
-                            footer_html_parts.append(html)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+    match = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", clean)
+    if match:
+        email = match.group(0)
+        if is_useful_email(email):
+            return email
+    return None
 
-            # Strategy B: Extract elements with footer-related class/ID names
-            footer_selectors = [
-                ".footer",
-                "#footer",
-                ".site-footer",
-                "#site-footer",
-                ".page-footer",
-                "#page-footer",
-                "[class*='footer']",
-                "[id*='footer']",
-                ".bottom",
-                "#bottom",
-                ".copyright",
-                "#copyright",
-            ]
-            for selector in footer_selectors:
-                try:
-                    elements = page.locator(selector).all()
-                    for el in elements:
-                        try:
-                            html = el.inner_html()
-                            if html:
-                                footer_html_parts.append(html)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
 
-            # Strategy C: Get the last 20% of the page HTML (rough footer area)
-            try:
-                full_html = page.content()
-                # Take the last 25% of the HTML as potential footer area
-                split_point = int(len(full_html) * 0.75)
-                bottom_html = full_html[split_point:]
-                footer_html_parts.append(bottom_html)
-            except Exception:
-                pass
+def lookup_email_requests(website_url: str) -> str:
+    """Try multiple contact page URLs until an email is found."""
+    if not website_url or str(website_url) == "nan" or website_url == "":
+        return ""
 
-            # Search for email in all collected footer parts
-            for footer_html in footer_html_parts:
-                email = extract_email_from_text_flexible(footer_html)
-                if email:
-                    email = clean_email(email)
-                    if is_useful_email(email):
-                        return row, email
+    base = website_url.rstrip("/")
 
-            # Strategy D: Also check full page for mailto: links in footer area
-            try:
-                mailto_links = page.locator("footer a[href*='mailto:']").all()
-                if not mailto_links:
-                    mailto_links = page.locator("[class*='footer'] a[href*='mailto:']").all()
-                if not mailto_links:
-                    mailto_links = page.locator("[id*='footer'] a[href*='mailto:']").all()
-                for link in mailto_links:
-                    try:
-                        href = link.get_attribute("href")
-                        if href and "mailto:" in href:
-                            email = href.replace("mailto:", "").split("?")[0].strip()
-                            email = clean_email(email)
-                            if is_useful_email(email):
-                                return row, email
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+    for path in CONTACT_PATHS:
+        url = f"{base}{path}" if path else base
+        html = fetch_page_requests(url)
+        if html:
+            email = extract_email_from_html(html)
+            if email:
+                return email
 
-        except PlaywrightTimeoutError:
-            pass
-        except Exception:
-            pass
-
-        # ============================================================
-        # STEP 2: If no email in footer, check contact pages
-        # ============================================================
-        for path in WEBSITE_EMAIL_PATHS:
-            url = f"{base}{path}" if path else base
-            if url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=WEBSITE_EMAIL_PLAYWRIGHT_TIMEOUT)
-                page.wait_for_timeout(1500)
-
-                email = _extract_email_from_page(page)
-                if email:
-                    email = clean_email(email)
-                    if is_useful_email(email):
-                        return row, email
-            except PlaywrightTimeoutError:
-                continue
-            except Exception:
-                continue
-
-        return row, ""
-
-    except Exception as exc:
-        print(f"    [PLAYWRIGHT WORKER ERROR] {row.get('website_url', '')[:60]} → {exc}")
-        return row, ""
-    finally:
-        try:
-            if browser:
-                browser.close()
-        except Exception:
-            pass
-        try:
-            if pw:
-                pw.stop()
-        except Exception:
-            pass
+    return ""
 
 
 def enrich_email_from_website_rows(
     rows: list[dict],
     store: CsvStore,
     max_lookups: int = 0,
-    max_workers: int = 4,
+    max_workers: int = 10,
 ) -> list[dict]:
     """
     For every row with website_url but no email, visit the website and
-    hunt for an email address (concurrently with Playwright).
-    
-    Args:
-        max_workers: Limited to prevent excessive memory/browser instances.
-                     Default 4 is safe for most machines.
+    hunt for an email address (concurrently with requests).
     """
     candidates = [
         r for r in rows
@@ -1139,216 +1328,47 @@ def enrich_email_from_website_rows(
         print("[EMAIL] No rows need email enrichment — skipping.")
         return rows
 
-    print(f"\n[EMAIL] Fetching emails for {total} rows (workers={max_workers}, footer-first with Playwright)...")
+    print(f"\n[EMAIL] Fetching emails for {total} rows (workers={max_workers}, requests-based)...")
+    print(f"  Strategy: Footer → Homepage → {len(CONTACT_PATHS)} contact paths | Timeout: {WEBSITE_TIMEOUT}s")
 
     updated = 0
+    skipped = 0
     checked = 0
-    lock = Lock()
-
-    def _cb(future):
-        nonlocal updated, checked
-        row, email = future.result()
-        with lock:
-            checked += 1
-            if email:
-                row["email"] = email
-                updated += 1
-                print(f"  [{checked}/{total}] ✓ {row['company_name'][:45]:<45}  {email}")
-            else:
-                print(f"  [{checked}/{total}] – {row['company_name'][:45]:<45}  (no email)")
-
-            if checked % AUTOSAVE_EVERY_NEW_RECORDS == 0:
-                store.write_all(rows)
-                print(f"  [CHECKPOINT] Saved after {checked} email lookups ({updated} found).")
+    emails_since_save = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch_email_for_row, r): r for r in candidates}
-        for f in as_completed(futures):
-            _cb(f)
+        futures = {
+            executor.submit(lookup_email_requests, row["website_url"]): i
+            for i, row in enumerate(candidates)
+        }
+
+        for future in as_completed(futures):
+            i = futures[future]
+            checked += 1
+
+            try:
+                email = future.result(timeout=WEBSITE_TIMEOUT + 5)
+            except FutureTimeoutError:
+                skipped += 1
+                continue
+
+            if email:
+                candidates[i]["email"] = email
+                updated += 1
+                emails_since_save += 1
+                print(f"  [{updated}] {candidates[i]['company_name'][:45]} → {email}")
+
+                if emails_since_save >= AUTOSAVE_EVERY_NEW_EMAILS:
+                    store.write_all(rows)
+                    print(f"  [SAVE] {updated} emails → checkpoint")
+                    emails_since_save = 0
+
+            if checked % 50 == 0:
+                print(f"  Progress: {checked}/{total}, found {updated}, skipped {skipped}")
 
     store.write_all(rows)
-    print(f"\n[EMAIL] Done. {updated}/{total} rows got email.")
+    print(f"\n[EMAIL] Done. {updated}/{total} rows got email. ({skipped} timed out)")
     return rows
-
-
-# ===== PARSE FUNCTIONS =====
-
-def extract_anchor_hrefs_and_text(html: str) -> list[tuple[str, str]]:
-    anchors: list[tuple[str, str]] = []
-    for href, inner in re.findall(
-        r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    ):
-        anchors.append((normalize_url(href.strip()), strip_tags(inner)))
-    return anchors
-
-
-def is_profile_url_for_country(profile_url: str, country: str) -> bool:
-    expected_code = (COUNTRY_CODES.get(country, "") or "").lower()
-    if not expected_code:
-        return True
-    path = (urlparse(profile_url).path or "").rstrip("/")
-    profile_id = path.split("/")[-1].lower() if path else ""
-    if not profile_id:
-        return False
-    return profile_id.startswith(expected_code)
-
-
-def parse_company_anchors_for_country(html: str, country: str) -> list[dict[str, str]]:
-    expected_code = (COUNTRY_CODES.get(country, "") or "").lower()
-    anchors: list[dict[str, str]] = []
-    seen_links: set[str] = set()
-
-    for href, name in re.findall(
-        r'<a[^>]+href=["\'](/c/[^"\']+)["\'][^>]*title=["\']([^"\']+)["\']',
-        html,
-        flags=re.I | re.S,
-    ):
-        clean_href = normalize_url(href)
-        clean_name = strip_tags(name)
-        if not clean_href or not clean_name:
-            continue
-        href_lower = clean_href.lower()
-        if "/c/p/" in href_lower:
-            continue
-        if expected_code and not is_profile_url_for_country(clean_href, country):
-            continue
-        canon = href_lower.rstrip("/")
-        if canon in seen_links:
-            continue
-        seen_links.add(canon)
-        anchors.append({"href": clean_href, "name": clean_name})
-
-    return anchors
-
-
-def extract_company_record(anchor: dict[str, str], keyword: str, country: str) -> SupplierRecord:
-    return SupplierRecord(
-        company_name=anchor.get("name", "").strip() or "Unknown Supplier",
-        website_url="",
-        country=country or "Unknown",
-        email="",
-        profile_url=anchor.get("href", "").strip(),
-    )
-
-
-def enrich_from_profile(
-    fetcher: Any,
-    record: SupplierRecord,
-    browser_holder: Optional[KompassBrowserHolder] = None,
-) -> None:
-    profile_url = (record.profile_url or "").strip()
-    if not profile_url:
-        return
-    try:
-        _, profile_html = fetch_html_with_browser_fallback(
-            fetcher, profile_url, browser_holder=browser_holder
-        )
-    except Exception:
-        return
-    if not record.website_url:
-        website = extract_external_website_from_profile(profile_html)
-        if website:
-            record.website_url = website
-
-
-# ===== SEARCH FUNCTIONS =====
-
-def click_kompass_pagination_page(browser_page: Optional[Page], page_number: int) -> tuple[int, str]:
-    if browser_page is None or page_number <= 1:
-        return 0, ""
-
-    selectors = (
-        f"#pagination-div-id a[href*='pageNbre={page_number}']",
-        f"a[href*='/searchCompanies/scroll?tab=cmp'][href*='pageNbre={page_number}']",
-    )
-    for selector in selectors:
-        try:
-            link = browser_page.locator(selector).first
-            if link.count() == 0 or not link.is_visible(timeout=1200):
-                continue
-            link.click(timeout=15000)
-            try:
-                browser_page.wait_for_load_state("domcontentloaded", timeout=30000)
-            except Exception:
-                pass
-            try:
-                browser_page.wait_for_load_state("networkidle", timeout=12000)
-            except Exception:
-                pass
-            browser_page.wait_for_timeout(1200)
-            html = browser_page.content()
-            if html:
-                return 200, html
-        except Exception:
-            continue
-    return 0, ""
-
-
-def build_warmup_url(keyword: str) -> str:
-    return (
-        f"{BASE_DOMAIN}/searchCompanies"
-        f"?text={quote_plus(keyword)}&searchType=COMPANYNAME&page=1"
-    )
-
-
-def build_search_urls(keyword: str, country: str, page: int) -> list[str]:
-    country_code = COUNTRY_CODES.get(country, "CN")
-    query = quote_plus(keyword)
-    country_label = quote_plus(country)
-    return [
-        (
-            f"{BASE_DOMAIN}/searchCompanies/facet"
-            f"?value={country_code}&label={country_label}&filterType=country"
-            f"&searchType=COMPANYNAME&checked=true&text={query}&page={page}"
-        ),
-        (
-            f"{BASE_DOMAIN}/searchCompanies"
-            f"?text={query}&searchType=COMPANYNAME&page={page}"
-            f"&localizationCode={country_code}&localizationType=COUNTRY"
-            f"&localizationLabel={country_label}"
-        ),
-    ]
-
-
-def seed_kompass_search_context(
-    fetcher: Any,
-    keyword: str,
-    browser_holder: Optional[KompassBrowserHolder] = None,
-) -> None:
-    if browser_holder is None or browser_holder.page is None:
-        return
-    try:
-        fetch_html_with_browser_fallback(
-            fetcher, build_warmup_url(keyword), browser_holder=browser_holder
-        )
-    except Exception:
-        pass
-
-
-# ===== DATAFRAME HELPERS =====
-
-def to_deduped_dataframe(records: list[SupplierRecord]) -> pd.DataFrame:
-    df = pd.DataFrame([asdict(r) for r in records])
-    if df.empty:
-        return df
-    df["company_name_norm"] = (
-        df["company_name"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .str.lower()
-        .str.replace(r"\s+", " ", regex=True)
-    )
-    return df.drop_duplicates(subset=["company_name_norm"]).drop(columns=["company_name_norm"])
-
-
-def save_checkpoint(records: list[SupplierRecord], output_path: str) -> None:
-    df = to_deduped_dataframe(records)
-    if df.empty:
-        return
-    df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
 
 # ===== MAIN SCRAPE FUNCTION =====
@@ -1576,12 +1596,191 @@ def scrape_kompass() -> tuple[pd.DataFrame, list[SupplierRecord]]:
     return final_df, all_records
 
 
+# ===== SEARCH FUNCTIONS =====
+
+def click_kompass_pagination_page(browser_page: Optional[Page], page_number: int) -> tuple[int, str]:
+    if browser_page is None or page_number <= 1:
+        return 0, ""
+
+    selectors = (
+        f"#pagination-div-id a[href*='pageNbre={page_number}']",
+        f"a[href*='/searchCompanies/scroll?tab=cmp'][href*='pageNbre={page_number}']",
+    )
+    for selector in selectors:
+        try:
+            link = browser_page.locator(selector).first
+            if link.count() == 0 or not link.is_visible(timeout=1200):
+                continue
+            link.click(timeout=15000)
+            try:
+                browser_page.wait_for_load_state("domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+            try:
+                browser_page.wait_for_load_state("networkidle", timeout=12000)
+            except Exception:
+                pass
+            browser_page.wait_for_timeout(1200)
+            html = browser_page.content()
+            if html:
+                return 200, html
+        except Exception:
+            continue
+    return 0, ""
+
+
+def build_warmup_url(keyword: str) -> str:
+    return (
+        f"{BASE_DOMAIN}/searchCompanies"
+        f"?text={quote_plus(keyword)}&searchType=COMPANYNAME&page=1"
+    )
+
+
+def build_search_urls(keyword: str, country: str, page: int) -> list[str]:
+    country_code = COUNTRY_CODES.get(country, "CN")
+    query = quote_plus(keyword)
+    country_label = quote_plus(country)
+    return [
+        (
+            f"{BASE_DOMAIN}/searchCompanies/facet"
+            f"?value={country_code}&label={country_label}&filterType=country"
+            f"&searchType=COMPANYNAME&checked=true&text={query}&page={page}"
+        ),
+        (
+            f"{BASE_DOMAIN}/searchCompanies"
+            f"?text={query}&searchType=COMPANYNAME&page={page}"
+            f"&localizationCode={country_code}&localizationType=COUNTRY"
+            f"&localizationLabel={country_label}"
+        ),
+    ]
+
+
+def seed_kompass_search_context(
+    fetcher: Any,
+    keyword: str,
+    browser_holder: Optional[KompassBrowserHolder] = None,
+) -> None:
+    if browser_holder is None or browser_holder.page is None:
+        return
+    try:
+        fetch_html_with_browser_fallback(
+            fetcher, build_warmup_url(keyword), browser_holder=browser_holder
+        )
+    except Exception:
+        pass
+
+
+# ===== PARSE FUNCTIONS =====
+
+def extract_anchor_hrefs_and_text(html: str) -> list[tuple[str, str]]:
+    anchors: list[tuple[str, str]] = []
+    for href, inner in re.findall(
+        r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        anchors.append((normalize_url(href.strip()), strip_tags(inner)))
+    return anchors
+
+
+def is_profile_url_for_country(profile_url: str, country: str) -> bool:
+    expected_code = (COUNTRY_CODES.get(country, "") or "").lower()
+    if not expected_code:
+        return True
+    path = (urlparse(profile_url).path or "").rstrip("/")
+    profile_id = path.split("/")[-1].lower() if path else ""
+    if not profile_id:
+        return False
+    return profile_id.startswith(expected_code)
+
+
+def parse_company_anchors_for_country(html: str, country: str) -> list[dict[str, str]]:
+    expected_code = (COUNTRY_CODES.get(country, "") or "").lower()
+    anchors: list[dict[str, str]] = []
+    seen_links: set[str] = set()
+
+    for href, name in re.findall(
+        r'<a[^>]+href=["\'](/c/[^"\']+)["\'][^>]*title=["\']([^"\']+)["\']',
+        html,
+        flags=re.I | re.S,
+    ):
+        clean_href = normalize_url(href)
+        clean_name = strip_tags(name)
+        if not clean_href or not clean_name:
+            continue
+        href_lower = clean_href.lower()
+        if "/c/p/" in href_lower:
+            continue
+        if expected_code and not is_profile_url_for_country(clean_href, country):
+            continue
+        canon = href_lower.rstrip("/")
+        if canon in seen_links:
+            continue
+        seen_links.add(canon)
+        anchors.append({"href": clean_href, "name": clean_name})
+
+    return anchors
+
+
+def extract_company_record(anchor: dict[str, str], keyword: str, country: str) -> SupplierRecord:
+    return SupplierRecord(
+        company_name=anchor.get("name", "").strip() or "Unknown Supplier",
+        website_url="",
+        country=country or "Unknown",
+        email="",
+        profile_url=anchor.get("href", "").strip(),
+    )
+
+
+def enrich_from_profile(
+    fetcher: Any,
+    record: SupplierRecord,
+    browser_holder: Optional[KompassBrowserHolder] = None,
+) -> None:
+    profile_url = (record.profile_url or "").strip()
+    if not profile_url:
+        return
+    try:
+        _, profile_html = fetch_html_with_browser_fallback(
+            fetcher, profile_url, browser_holder=browser_holder
+        )
+    except Exception:
+        return
+    if not record.website_url:
+        website = extract_external_website_from_profile(profile_html)
+        if website:
+            record.website_url = website
+
+
+# ===== DATAFRAME HELPERS =====
+
+def to_deduped_dataframe(records: list[SupplierRecord]) -> pd.DataFrame:
+    df = pd.DataFrame([asdict(r) for r in records])
+    if df.empty:
+        return df
+    df["company_name_norm"] = (
+        df["company_name"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .str.replace(r"\s+", " ", regex=True)
+    )
+    return df.drop_duplicates(subset=["company_name_norm"]).drop(columns=["company_name_norm"])
+
+
+def save_checkpoint(records: list[SupplierRecord], output_path: str) -> None:
+    df = to_deduped_dataframe(records)
+    if df.empty:
+        return
+    df.to_csv(output_path, index=False, encoding="utf-8-sig")
+
+
 # ===== ENRICHMENT ORCHESTRATION =====
 
 def run_enrichment(rows: list[dict], checkpoint_path: str, enriched_path: str) -> list[dict]:
     """Run Phase 2A (profile→website) and Phase 2B (website→email) enrichment."""
-    
-    # Merge any existing checkpoint data
+
     checkpoint_store = CsvStore(checkpoint_path)
     checkpoint_rows = checkpoint_store.read_all()
     if checkpoint_rows:
@@ -1600,12 +1799,12 @@ def run_enrichment(rows: list[dict], checkpoint_path: str, enriched_path: str) -
                     merged += 1
                 if not row.get("email") and cp.get("email"):
                     row["email"] = cp["email"]
-        print(f"[CHECKPOINT] Merged {merged} website_url values from previous run.")
+        if merged:
+            print(f"[CHECKPOINT] Merged {merged} values from previous run.")
 
     store = CsvStore(checkpoint_path)
 
     try:
-        # Phase 2A: Profile → Website
         if ENABLE_PROFILE_WEBSITE_ENRICHMENT:
             print("[PROFILE] Starting profile-website enrichment pass...")
             rows = enrich_website_from_profile_rows(rows, store, MAX_PROFILE_WEBSITE_LOOKUPS)
@@ -1613,13 +1812,10 @@ def run_enrichment(rows: list[dict], checkpoint_path: str, enriched_path: str) -
         else:
             print("[PROFILE] Profile-website enrichment disabled.")
 
-        # Phase 2B: Website → Email
         if ENABLE_WEBSITE_EMAIL_ENRICHMENT:
-            print("[WEBSITE] Starting website-email enrichment pass (footer-first with Playwright)...")
-            # Limit workers to prevent excessive browser instances
-            email_workers = min(WEBSITE_EMAIL_WORKERS, 4)
+            print("[WEBSITE] Starting website-email enrichment pass (requests-based, footer-first)...")
             rows = enrich_email_from_website_rows(
-                rows, store, MAX_WEBSITE_EMAIL_LOOKUPS, max_workers=email_workers
+                rows, store, MAX_WEBSITE_EMAIL_LOOKUPS, max_workers=WEBSITE_EMAIL_WORKERS
             )
             print("[WEBSITE] Website-email enrichment complete.")
         else:
@@ -1631,7 +1827,6 @@ def run_enrichment(rows: list[dict], checkpoint_path: str, enriched_path: str) -
         print(f"[SAVED] Checkpoint written to {checkpoint_path}")
         return rows
 
-    # Save enriched output
     enriched_store = CsvStore(enriched_path)
     enriched_store.write_all(rows)
     print(f"[SAVE] Enriched data saved to {enriched_path}")
@@ -1643,7 +1838,7 @@ def run_enrichment(rows: list[dict], checkpoint_path: str, enriched_path: str) -
 
 def main() -> None:
     global WEBSITE_EMAIL_WORKERS, MAX_PROFILE_WEBSITE_LOOKUPS, MAX_WEBSITE_EMAIL_LOOKUPS, USE_PLAYWRIGHT_PROFILE
-    
+
     parser = argparse.ArgumentParser(
         description="Kompass supplier scraper with integrated enrichment."
     )
@@ -1667,8 +1862,6 @@ def main() -> None:
                         help="Max website pages to check for email (0=all)")
     parser.add_argument("--no-playwright-profile", action="store_true",
                         help="Use HTTP only for Kompass profile pages")
-    parser.add_argument("--no-playwright-email", action="store_true",
-                        help="Use simple HTTP (not Playwright) for email extraction")
     args = parser.parse_args()
 
     WEBSITE_EMAIL_WORKERS = args.workers
@@ -1676,16 +1869,14 @@ def main() -> None:
     MAX_WEBSITE_EMAIL_LOOKUPS = args.max_email_lookups
     if args.no_playwright_profile:
         USE_PLAYWRIGHT_PROFILE = False
-    if args.no_playwright_email:
-        global WEBSITE_EMAIL_USE_PLAYWRIGHT_PAGE
-        WEBSITE_EMAIL_USE_PLAYWRIGHT_PAGE = False
 
     print("=" * 60)
     print("  Kompass Supplier Scraper + Enrichment")
     print(f"  Proxy    : {'ON' if KOMPASS_USE_PROXY else 'OFF'}")
     print(f"  Profile  : {'Playwright' if USE_PLAYWRIGHT_PROFILE else 'HTTP only'}")
-    print(f"  Email    : {'Playwright (footer-first)' if WEBSITE_EMAIL_USE_PLAYWRIGHT_PAGE else 'HTTP simple'}")
+    print(f"  Email    : requests-based (footer-first, {WEBSITE_TIMEOUT}s timeout)")
     print(f"  Workers  : {WEBSITE_EMAIL_WORKERS}")
+    print(f"  Contact paths: {len(CONTACT_PATHS)}")
     print(f"  Cleaned output: {args.output}")
     print("=" * 60)
 
@@ -1709,7 +1900,6 @@ def main() -> None:
             return
         with open(input_path, newline="", encoding="utf-8-sig") as fh:
             all_rows = list(csv.DictReader(fh))
-        # Ensure all fieldnames exist
         for row in all_rows:
             for f in FIELDNAMES:
                 row.setdefault(f, "")
@@ -1727,7 +1917,6 @@ def main() -> None:
     else:
         print("\n[SKIP] Phase 2 enrichment skipped.")
 
-    # Generate cleaned output: only rows with valid email
     cleaned_rows = [
         r for r in all_rows
         if (r.get("email") or "").strip() and is_useful_email(r["email"].strip())
@@ -1740,7 +1929,6 @@ def main() -> None:
     else:
         print("\n[CLEANED] No records with valid emails found.")
 
-    # Final stats
     with_website = sum(1 for r in all_rows if (r.get("website_url") or "").strip())
     with_email = sum(1 for r in all_rows if (r.get("email") or "").strip())
     print(f"\n{'=' * 60}")

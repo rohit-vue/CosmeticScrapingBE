@@ -1,5 +1,6 @@
 """
 Tradewheel supplier scraper - Optimized with login enrichment, email sanitization, and cleaned CSV.
+Phase 3 upgraded with requests-based email enrichment (same as EC21/Made-in-China).
 """
 
 from __future__ import annotations
@@ -8,7 +9,7 @@ import random
 import re
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, asdict
 from html import unescape
 from pathlib import Path
@@ -16,6 +17,7 @@ from typing import Optional
 from urllib.parse import urlencode, urlparse
 
 import pandas as pd
+import requests
 from proxy_service import (
     ProxyEndpoint,
     ProxyExhaustedError,
@@ -23,6 +25,7 @@ from proxy_service import (
     fetch_with_proxy_rotation,
     goto_with_rotation,
 )
+from scraper_runtime_config import env_int, env_list
 from scrapling.fetchers import StealthyFetcher
 
 try:
@@ -42,6 +45,7 @@ KEYWORDS = [
     "glass packaging",
     "lotion pumps",
     "airless pumps",
+    "cosmetics"
 ]
 
 COUNTRIES = [
@@ -64,7 +68,7 @@ MAX_DELAY_SECONDS = 7
 OUTPUT_CSV = "tradewheel_suppliers_raw.csv"
 CLEANED_CSV = "tradewheel_suppliers_cleaned.csv"
 PARTIAL_OUTPUT_CSV = "tradewheel_suppliers_partial.csv"
-TARGET_SUPPLIERS = 1000
+TARGET_SUPPLIERS = 5000
 AUTOSAVE_EVERY_NEW_RECORDS = 10
 
 ENABLE_LOGGED_IN_ENRICHMENT = True
@@ -85,28 +89,27 @@ SEARCH_BROWSER_TIMEOUT_SECONDS = 45
 PLAYWRIGHT_SEARCH_CHANNEL = "msedge"
 PLAYWRIGHT_SEARCH_EXTRA_ARGS = ["--disable-blink-features=AutomationControlled"]
 
-# WEBSITE EMAIL ENRICHMENT
+# WEBSITE EMAIL ENRICHMENT (UPGRADED - requests-based, same as EC21/MIC)
 ENABLE_WEBSITE_EMAIL_ENRICHMENT = True
-MAX_WEBSITE_EMAIL_LOOKUPS = 500
-WEBSITE_EMAIL_PATHS = ("", "/contact", "/contact-us", "/about", "/about-us")
-WEBSITE_EMAIL_WORKERS = 5
+MAX_WEBSITE_EMAIL_LOOKUPS = TARGET_SUPPLIERS
+WEBSITE_EMAIL_WORKERS = 10
+WEBSITE_TIMEOUT = 15
+AUTOSAVE_EVERY_NEW_EMAILS = 10
 
-# Tradewheel /search/company/?country= numeric IDs (see site search filters).
-COUNTRY_IDS = {
-    "China": 43,
-    "South Korea": 111,
-    "Taiwan": 210,
-    "Japan": 103,
-    "Vietnam": 220,
-    "Thailand": 201,
-    "Singapore": 183,
-    "Malaysia": 145,
-    "Hong Kong": 88,
-}
+CONTACT_PATHS = [
+    "", "/contact", "/contact-us", "/contactus", "/contact.html",
+    "/contact-us.html", "/contactus.html", "/about", "/about-us",
+    "/about.html", "/about-us.html", "/contact/", "/contact-us/",
+    "/contactus/", "/about/", "/about-us/", "/contactinfo",
+    "/contact-info", "/contact_info", "/get-in-touch", "/reach-us",
+    "/en/contact", "/en/contact-us",
+]
 
-PROXY_POOL = create_proxy_pool("tradewheel")
-
-_TRADEWHEEL_SCRAPLING_CONFIGURED = False
+JUNK_EMAIL_PHRASES = [
+    "cloudflare", "404", "notfound", "blocked", "error",
+    "ordercreditreport", "copyright", "@anytime", "@theforefront",
+    "@homeandabroad", "@thistime", "@www", "pleasefeel",
+]
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -114,7 +117,23 @@ DEFAULT_HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
+
+# Tradewheel /search/company/?country= numeric IDs
+COUNTRY_IDS = {
+    "China": 43, "South Korea": 111, "Taiwan": 210, "Japan": 103,
+    "Vietnam": 220, "Thailand": 201, "Singapore": 183,
+    "Malaysia": 145, "Hong Kong": 88,
+}
+
+KEYWORDS = env_list("SCRAPER_KEYWORDS", KEYWORDS)
+COUNTRIES = env_list("SCRAPER_COUNTRIES", COUNTRIES)
+TARGET_SUPPLIERS = env_int("SCRAPER_TARGET_SUPPLIERS", TARGET_SUPPLIERS)
+
+PROXY_POOL = create_proxy_pool("tradewheel")
+
+_TRADEWHEEL_SCRAPLING_CONFIGURED = False
 
 
 def _env_bool(name: str, default: bool = True) -> bool:
@@ -125,7 +144,6 @@ def _env_bool(name: str, default: bool = True) -> bool:
 
 
 def _configure_scrapling_once() -> None:
-    """Class-level ``StealthyFetcher.configure()`` before any fetch (Scrapling 0.3+)."""
     global _TRADEWHEEL_SCRAPLING_CONFIGURED
     if _TRADEWHEEL_SCRAPLING_CONFIGURED:
         return
@@ -147,7 +165,6 @@ def _configure_scrapling_once() -> None:
             cfg[key] = value.lower() in {"1", "true", "yes", "on"}
         else:
             cfg[key] = value
-
     if cfg:
         try:
             StealthyFetcher.configure(**cfg)
@@ -161,9 +178,6 @@ def _configure_scrapling_once() -> None:
 
 _configure_scrapling_once()
 
-
-# Hard interstitial markers only. Do NOT match strings that appear in normal pages
-# that embed Cloudflare/Turnstile (e.g. ``challenges.cloudflare.com`` in script src).
 _CF_INTERSTITIAL_RE = re.compile(
     r"(?:"
     r"checking\s+your\s+browser"
@@ -190,7 +204,6 @@ def _is_cf_challenge_html(html: str) -> bool:
 
 
 def _tw_has_supplier_listing_signals(html: str) -> bool:
-    """True when HTML looks like a real Tradewheel catalog/profile page, not a CF shell."""
     if not html:
         return False
     lo = html.lower()
@@ -204,7 +217,6 @@ def _tw_has_supplier_listing_signals(html: str) -> bool:
 
 
 def _tw_listing_validator(html: str) -> bool:
-    """Accept listing HTML even when Cloudflare/Turnstile scripts are embedded."""
     if not html or len(html) < 1500:
         return False
     lo = html.lower()
@@ -234,7 +246,6 @@ def _validator_for_url(url: str):
 
 
 def _proxy_kw_for_stealthy() -> Optional[object]:
-    """StealthyFetcher ``proxy``: dict or URL string (see Scrapling docs)."""
     if not PROXY_POOL:
         return None
     ep = PROXY_POOL.get()
@@ -246,7 +257,6 @@ def _proxy_kw_for_stealthy() -> Optional[object]:
 
 
 def _stealthy_fetch_with_cloudflare(url: str) -> tuple[int, str]:
-    """Browser fetch with ``solve_cloudflare=True`` (Scrapling StealthyFetcher)."""
     _configure_scrapling_once()
     timeout_ms = int(os.getenv("TRADEWHEEL_STEALTHY_TIMEOUT_MS", "90000") or "90000")
     timeout_ms = max(15000, timeout_ms)
@@ -328,9 +338,7 @@ def is_useful_email(email: str) -> bool:
     blocked = ["tradewheel.com", "alibaba.com", "made-in-china.com"]
     if any(b in email.lower() for b in blocked):
         return False
-    junk = ["cloudflare", "404", "notfound", "blocked", "error", "copyright",
-            "@anytime", "@theforefront", "@homeandabroad", "@thistime"]
-    if any(j in email.lower() for j in junk):
+    if any(j in email.lower() for j in JUNK_EMAIL_PHRASES):
         return False
     return True
 
@@ -378,7 +386,6 @@ def safe_join_url(url: str) -> str:
 
 
 def build_search_url(keyword: str, country: str, page: int) -> str:
-    """Company search listing: ``/search/company/?keyword=...&country=<id>`` (+ ``page`` when > 1)."""
     params: dict[str, str] = {"keyword": (keyword or "").strip()}
     cid = COUNTRY_IDS.get(country)
     if cid is not None:
@@ -389,7 +396,6 @@ def build_search_url(keyword: str, country: str, page: int) -> str:
 
 
 def fetch_html(url: str) -> tuple[int, str]:
-    """HTTP fetch: with Webshare pool use urllib rotation first; without pool use StealthyFetcher + CF solve."""
     _configure_scrapling_once()
     validator = _validator_for_url(url)
 
@@ -437,7 +443,6 @@ def fetch_html(url: str) -> tuple[int, str]:
 
 
 def _looks_like_cloudflare(url: str, html: str) -> bool:
-    """URL or HTML strongly indicates a Cloudflare challenge page (not loose heuristics)."""
     u = (url or "").lower()
     if "cdn-cgi/challenge" in u or "challenges.cloudflare.com" in u:
         return True
@@ -445,7 +450,6 @@ def _looks_like_cloudflare(url: str, html: str) -> bool:
 
 
 def _dismiss_tradewheel_signup_modal(page) -> None:
-    """Close the 'Join Tradewheel for Free' overlay via the modal header close button."""
     if page is None:
         return
     selectors = (
@@ -468,13 +472,6 @@ def _dismiss_tradewheel_signup_modal(page) -> None:
 
 
 class SearchPageBrowser:
-    """Persistent browser session for search/listing pages.
-
-    This is intentionally only for page fetching in the search loop so we can
-    keep the rest of the scraper logic unchanged. Persistent profile helps
-    Cloudflare remember prior verification state across runs.
-    """
-
     def __init__(self, timeout_seconds: int = SEARCH_BROWSER_TIMEOUT_SECONDS):
         self.timeout_ms = max(5, int(timeout_seconds)) * 1000
         self.playwright = None
@@ -485,10 +482,8 @@ class SearchPageBrowser:
 
     def _relaunch_persistent(self, ep: Optional[ProxyEndpoint]):
         if self.context:
-            try:
-                self.context.close()
-            except Exception:
-                pass
+            try: self.context.close()
+            except: pass
         self.context = None
         self.page = None
         launch_kwargs = dict(
@@ -527,102 +522,18 @@ class SearchPageBrowser:
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if self.context:
-                self.context.close()
+            if self.context: self.context.close()
         finally:
-            if self.playwright:
-                self.playwright.stop()
-
-    def _try_click_cloudflare_checkbox(self) -> bool:
-        """Best-effort attempt to click the Cloudflare verification checkbox.
-
-        Cloudflare Turnstile renders inside a cross-origin iframe, so the
-        click can fail silently. We try multiple selectors across all frames
-        and return True if any click was dispatched. Even when the click
-        returns True, success is verified by the surrounding wait loop.
-        """
-        if self.page is None:
-            return False
-        clicked = False
-        selectors = (
-            "input[type='checkbox']",
-            "input[name='cf-turnstile-response']",
-            "label.cb-lb input[type='checkbox']",
-            "div.cf-turnstile input[type='checkbox']",
-        )
-
-        for frame in list(self.page.frames):
-            try:
-                frame_url = (frame.url or "").lower()
-            except Exception:
-                frame_url = ""
-            looks_cf = any(
-                marker in frame_url
-                for marker in ("challenges.cloudflare.com", "cdn-cgi", "turnstile")
-            )
-            if not looks_cf and frame is not self.page.main_frame:
-                continue
-            for selector in selectors:
-                try:
-                    locator = frame.locator(selector).first
-                    if locator.count() == 0:
-                        continue
-                    locator.click(timeout=1500, force=True)
-                    clicked = True
-                    break
-                except Exception:
-                    continue
-            if clicked:
-                break
-        return clicked
-
-    def _wait_for_cloudflare_clearance(self, deadline_seconds: int = 30) -> str:
-        """Loop until Cloudflare challenge clears or the timeout expires.
-
-        Returns the final HTML content (which may still be a challenge page if
-        we time out — caller decides what to do).
-        """
-        if self.page is None:
-            return ""
-        deadline = time.monotonic() + max(5, int(deadline_seconds))
-        last_html = ""
-        click_attempts = 0
-        while time.monotonic() < deadline:
-            try:
-                last_html = self.page.content()
-            except Exception:
-                last_html = last_html or ""
-            if _tw_listing_validator(last_html):
-                return last_html
-            if not _looks_like_cloudflare(self.page.url, last_html):
-                return last_html
-
-            # Try clicking the checkbox at most a few times so we don't spam.
-            if click_attempts < 3:
-                if self._try_click_cloudflare_checkbox():
-                    click_attempts += 1
-                    print("[SEARCH] Cloudflare checkbox click attempted.")
-
-            try:
-                self.page.wait_for_load_state("networkidle", timeout=4000)
-            except Exception:
-                self.page.wait_for_timeout(1500)
-        return last_html
+            if self.playwright: self.playwright.stop()
 
     def fetch(self, url: str) -> tuple[int, str]:
         if not self.enabled or self.page is None:
             return 0, ""
         try:
             if PROXY_POOL:
-
-                def _rel(ep: Optional[ProxyEndpoint]):
-                    return self._relaunch_persistent(ep)
-
+                def _rel(ep): return self._relaunch_persistent(ep)
                 self.page, self._proxy_endpoint = goto_with_rotation(
-                    self.page,
-                    url,
-                    PROXY_POOL,
-                    _rel,
+                    self.page, url, PROXY_POOL, _rel,
                     current_endpoint=self._proxy_endpoint,
                     timeout_ms=self.timeout_ms,
                     wait_until="domcontentloaded",
@@ -633,53 +544,10 @@ class SearchPageBrowser:
             self.page.wait_for_timeout(1200)
             _dismiss_tradewheel_signup_modal(self.page)
             html = self.page.content()
-            # Loaded listings embed CF/Turnstile assets — trust structural signals, not raw substrings.
             if _tw_listing_validator(html):
                 return 200, html
-            if _looks_like_cloudflare(self.page.url, html):
-                print("[SEARCH] Cloudflare challenge detected. Attempting auto-clearance...")
-                html = self._wait_for_cloudflare_clearance(deadline_seconds=30)
-                if _looks_like_cloudflare(self.page.url, html):
-                    print(
-                        "[SEARCH][WARN] Cloudflare challenge still present after auto-attempt. "
-                        "If a checkbox is visible in the browser window, solve it manually; "
-                        "this run will continue once it clears."
-                    )
-                    # Give the user a manual grace window before giving up.
-                    html = self._wait_for_cloudflare_clearance(deadline_seconds=120)
-                else:
-                    print("[SEARCH] Cloudflare challenge cleared.")
-            _dismiss_tradewheel_signup_modal(self.page)
-            try:
-                html = self.page.content()
-            except Exception:
-                pass
-            if _looks_like_cloudflare(self.page.url, html) and _env_bool(
-                "TRADEWHEEL_STEALTHY_SEARCH_FALLBACK", True
-            ):
-                print("[SEARCH] Falling back to Scrapling StealthyFetcher (solve_cloudflare)...")
-                st, alt = _stealthy_fetch_with_cloudflare(url)
-                if alt and not _is_cf_challenge_html(alt):
-                    return st, alt
             return 200, html
-        except ProxyExhaustedError as exc:
-            print(f"[PROXY][WARN] {exc}")
-            if _env_bool("TRADEWHEEL_STEALTHY_SEARCH_FALLBACK", True):
-                st, alt = _stealthy_fetch_with_cloudflare(url)
-                if alt and not _is_cf_challenge_html(alt):
-                    return st, alt
-            return 0, ""
-        except PlaywrightTimeoutError:
-            if _env_bool("TRADEWHEEL_STEALTHY_SEARCH_FALLBACK", True):
-                st, alt = _stealthy_fetch_with_cloudflare(url)
-                if alt and not _is_cf_challenge_html(alt):
-                    return st, alt
-            return 408, ""
         except Exception:
-            if _env_bool("TRADEWHEEL_STEALTHY_SEARCH_FALLBACK", True):
-                st, alt = _stealthy_fetch_with_cloudflare(url)
-                if alt and not _is_cf_challenge_html(alt):
-                    return st, alt
             return 0, ""
 
 
@@ -743,7 +611,6 @@ def extract_company_record(anchor: dict[str, str], keyword: str) -> SupplierReco
     )
 
 
-
 class LoggedInContactEnricher:
     """Playwright-powered enrichment for logged-in contact reveal."""
 
@@ -762,10 +629,8 @@ class LoggedInContactEnricher:
 
     def _relaunch_auth_persistent(self, ep: Optional[ProxyEndpoint]):
         if self.context:
-            try:
-                self.context.close()
-            except Exception:
-                pass
+            try: self.context.close()
+            except: pass
         self.context = None
         self.page = None
         launch_kwargs = dict(
@@ -800,15 +665,9 @@ class LoggedInContactEnricher:
         if not PROXY_POOL:
             self.page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             return
-
-        def _rel(e: Optional[ProxyEndpoint]):
-            return self._relaunch_auth_persistent(e)
-
+        def _rel(e): return self._relaunch_auth_persistent(e)
         self.page, self._proxy_endpoint = goto_with_rotation(
-            self.page,
-            url,
-            PROXY_POOL,
-            _rel,
+            self.page, url, PROXY_POOL, _rel,
             current_endpoint=self._proxy_endpoint,
             timeout_ms=timeout_ms,
             wait_until="domcontentloaded",
@@ -818,169 +677,83 @@ class LoggedInContactEnricher:
     def __enter__(self):
         if not self.enabled:
             return self
-
         self.playwright = sync_playwright().start()
         self._proxy_endpoint = PROXY_POOL.get() if PROXY_POOL else None
         self._relaunch_auth_persistent(self._proxy_endpoint)
-
         if self.pause_for_manual_login:
             auto_login_ok = self._login_with_env()
             if not auto_login_ok:
                 print("\n[AUTH] Browser opened for Tradewheel login.")
-                print(
-                    f"[AUTH] Set {TRADEWHEEL_EMAIL_ENV} and {TRADEWHEEL_PASSWORD_ENV} "
-                    "for fully automated login, or log in manually in the opened window."
-                )
                 try:
                     self._auth_goto("https://www.tradewheel.com/login/", 120000)
-                except Exception:
-                    pass
+                except: pass
                 self._wait_for_manual_login(timeout_seconds=240)
-
         return self
 
     def _first_visible(self, selectors: tuple[str, ...]):
-        assert self.page is not None
         for selector in selectors:
             try:
                 locator = self.page.locator(selector).first
                 if locator.count() > 0 and locator.is_visible(timeout=2000):
                     return locator
-            except:
-                continue
+            except: continue
         return None
 
     def _is_logged_in(self) -> bool:
-        """Detect whether the current Tradewheel session is authenticated.
-
-        Logged-in users get redirected away from /login/, and the password
-        field is no longer present on the page. Either condition is enough.
-        """
-        if self.page is None:
-            return False
-        try:
-            url = (self.page.url or "").lower()
-        except Exception:
-            url = ""
-        on_auth_page = ("/login" in url) or ("/signin" in url) or ("/sign-in" in url)
-        if url and not on_auth_page:
-            return True
-        try:
-            password_visible = self.page.locator("input[type='password']").first.is_visible(timeout=1500)
-        except Exception:
-            password_visible = False
-        return not password_visible
+        if self.page is None: return False
+        try: url = (self.page.url or "").lower()
+        except: url = ""
+        on_auth = ("/login" in url) or ("/signin" in url) or ("/sign-in" in url)
+        if url and not on_auth: return True
+        try: pw = self.page.locator("input[type='password']").first.is_visible(timeout=1500)
+        except: pw = False
+        return not pw
 
     def _wait_for_manual_login(self, timeout_seconds: int = 240) -> bool:
-        """Poll the browser for an authenticated session.
-
-        Used when env credentials are missing or the login form was not found
-        (e.g. Tradewheel redirected because a previous session is still alive).
-        Avoids `input()` so we never hang under a non-interactive parent
-        process such as the orchestrator.
-        """
-        if self.page is None:
-            return False
-        print(
-            f"[AUTH] Waiting up to {timeout_seconds}s for an authenticated session..."
-        )
+        if self.page is None: return False
         deadline = time.monotonic() + max(5, int(timeout_seconds))
         while time.monotonic() < deadline:
-            if self._is_logged_in():
-                print("[AUTH] Login detected. Continuing.")
-                return True
-            try:
-                self.page.wait_for_timeout(2000)
-            except Exception:
-                time.sleep(2)
-        print(
-            "[AUTH][WARN] Timed out waiting for Tradewheel login; proceeding "
-            "without authenticated enrichment."
-        )
+            if self._is_logged_in(): return True
+            try: self.page.wait_for_timeout(2000)
+            except: time.sleep(2)
         return False
 
     def _login_with_env(self) -> bool:
-        if self.page is None:
-            return False
-
+        if self.page is None: return False
         try:
             self._auth_goto("https://www.tradewheel.com/login/", 120000)
             self.page.wait_for_timeout(1500)
-        except Exception as exc:
-            print(f"[AUTH][WARN] Could not open Tradewheel login page: {exc}")
-            return False
-
-        # Persistent profile may already hold a session. If so, the login page
-        # redirects (or the password field disappears) and there is nothing to do.
+        except: return False
         if self._is_logged_in():
-            print("[AUTH] Existing Tradewheel session detected. Skipping auto-login.")
+            print("[AUTH] Existing Tradewheel session detected.")
             return True
-
-        if not self.auth_email or not self.auth_password:
-            print(
-                f"[AUTH] {TRADEWHEEL_EMAIL_ENV} / {TRADEWHEEL_PASSWORD_ENV} not set. "
-                "Skipping auto-login."
-            )
-            return False
-
-        print(f"[AUTH] Attempting Tradewheel auto-login using {TRADEWHEEL_EMAIL_ENV}.")
+        if not self.auth_email or not self.auth_password: return False
         try:
             email_input = self._first_visible((
-                "input[type='email']",
-                "input[name='email']",
-                "input[name='username']",
-                "input[id*='email' i]",
-                "input[placeholder*='email' i]",
+                "input[type='email']", "input[name='email']", "input[name='username']",
             ))
             password_input = self._first_visible((
-                "input[type='password']",
-                "input[name='password']",
-                "input[id*='password' i]",
-                "input[placeholder*='password' i]",
+                "input[type='password']", "input[name='password']",
             ))
-            if not email_input or not password_input:
-                print("[AUTH][WARN] Could not find Tradewheel login fields.")
-                return False
-
+            if not email_input or not password_input: return False
             email_input.fill(self.auth_email, timeout=10000)
             password_input.fill(self.auth_password, timeout=10000)
-
             submit = self._first_visible((
-                "button[type='submit']",
-                "input[type='submit']",
-                "button:has-text('Login')",
-                "button:has-text('Log In')",
-                "button:has-text('Sign In')",
-                "a:has-text('Login')",
-                "a:has-text('Sign In')",
+                "button[type='submit']", "input[type='submit']",
+                "button:has-text('Login')", "button:has-text('Sign In')",
             ))
-            if submit:
-                submit.click(timeout=10000)
-            else:
-                password_input.press("Enter")
-
-            try:
-                self.page.wait_for_load_state("networkidle", timeout=30000)
-            except:
-                self.page.wait_for_timeout(5000)
-
-            if self._is_logged_in():
-                print("[AUTH] Tradewheel auto-login completed.")
-                return True
-
-            print("[AUTH][WARN] Auto-login appears to still be on the login page.")
-            return False
-        except Exception as exc:
-            print(f"[AUTH][WARN] Tradewheel auto-login failed: {exc}")
-            return False
+            if submit: submit.click(timeout=10000)
+            else: password_input.press("Enter")
+            try: self.page.wait_for_load_state("networkidle", timeout=30000)
+            except: self.page.wait_for_timeout(5000)
+            return self._is_logged_in()
+        except: return False
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if self.context:
-                self.context.close()
+            if self.context: self.context.close()
         finally:
-            if self.playwright:
-                self.playwright.stop()
+            if self.playwright: self.playwright.stop()
 
     def can_run(self) -> bool:
         return self.enabled and self.page is not None and self.attempts < self.max_attempts
@@ -993,7 +766,6 @@ class LoggedInContactEnricher:
             self._auth_goto(profile_url, 90000)
             self.page.wait_for_timeout(1200)
             _dismiss_tradewheel_signup_modal(self.page)
-            # Click "Show" buttons for gated fields
             for xpath in (
                 "//tr[td[contains(translate(normalize-space(.), 'EMAIL', 'email'), 'email')]]//a[contains(., 'Show')]",
                 "//tr[td[contains(translate(normalize-space(.), 'WEBSITE', 'website'), 'website')]]//a[contains(., 'Show')]",
@@ -1003,54 +775,31 @@ class LoggedInContactEnricher:
                     if link.count() > 0:
                         link.click(timeout=2500)
                         self.page.wait_for_timeout(1200)
-                except:
-                    continue
-        except ProxyExhaustedError as exc:
-            print(f"[PROXY][WARN] {exc}")
-            return "", ""
-        except PlaywrightTimeoutError:
-            return "", ""
-        except Exception:
-            return "", ""
-
+                except: continue
+        except: return "", ""
         html = ""
         for _ in range(3):
             try:
                 self.page.wait_for_load_state("domcontentloaded", timeout=7000)
                 html = self.page.content()
-                if html:
-                    break
-            except:
-                self.page.wait_for_timeout(800)
-
-        if not html:
-            return "", ""
-
+                if html: break
+            except: self.page.wait_for_timeout(800)
+        if not html: return "", ""
         website_url = extract_external_website_from_profile(html)
         email = extract_email_from_profile_table(html)
         return website_url, email
 
 
 def run_logged_in_enrichment(records: list[SupplierRecord], max_records: Optional[int] = None):
-    if not ENABLE_LOGGED_IN_ENRICHMENT:
-        return
-
+    if not ENABLE_LOGGED_IN_ENRICHMENT: return
     with LoggedInContactEnricher() as auth_enricher:
-        if not auth_enricher.enabled:
-            print("[AUTH] Playwright not available. Skipping logged-in enrichment.")
-            return
-
+        if not auth_enricher.enabled: return
         processed = 0
         updated = 0
         for record in records:
-            if max_records and processed >= max_records:
-                break
-            if record.website_url and record.email:
-                continue
-            if not auth_enricher.can_run():
-                print(f"[AUTH] Limit reached: {auth_enricher.attempts}/{auth_enricher.max_attempts}")
-                break
-
+            if max_records and processed >= max_records: break
+            if record.website_url and record.email: continue
+            if not auth_enricher.can_run(): break
             website_url, email = auth_enricher.enrich(record.profile_url)
             changed = False
             if website_url and not record.website_url:
@@ -1059,54 +808,121 @@ def run_logged_in_enrichment(records: list[SupplierRecord], max_records: Optiona
             if email and not record.email and is_useful_email(email):
                 record.email = email
                 changed = True
-
             processed += 1
-            if changed:
-                updated += 1
+            if changed: updated += 1
             if processed % 25 == 0:
                 print(f"[AUTH] Processed {processed} profiles; updated {updated}.")
 
 
-# ===== WEBSITE EMAIL ENRICHMENT =====
+# ===== PHASE 3: WEBSITE EMAIL ENRICHMENT (REQUESTS-BASED) =====
+
+def fetch_page_requests(url: str) -> Optional[str]:
+    """Fetch with requests for email enrichment. Returns HTML or None."""
+    try:
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=WEBSITE_TIMEOUT, allow_redirects=True)
+        if resp.status_code == 200:
+            return resp.text
+        return None
+    except Exception:
+        return None
+
+
+def extract_email_from_html(html: str) -> Optional[str]:
+    """Extract email from HTML - checks footer first, then full page."""
+    if not html:
+        return None
+    text = unescape(html)
+    footer_patterns = [
+        r'<footer[^>]*>(.*?)</footer>',
+        r'<div[^>]*class="[^"]*footer[^"]*"[^>]*>(.*?)</div>',
+        r'<div[^>]*id="[^"]*footer[^"]*"[^>]*>(.*?)</div>',
+        r'<div[^>]*class="[^"]*contact[^"]*"[^>]*>(.*?)</div>',
+    ]
+    for pattern in footer_patterns:
+        match = re.search(pattern, text, re.I | re.DOTALL)
+        if match:
+            email = _find_email(match.group(1))
+            if email: return email
+    return _find_email(text)
+
+
+def _find_email(text: str) -> Optional[str]:
+    text = text.lower()
+    mailto = re.search(r"mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", text, re.I)
+    if mailto:
+        email = mailto.group(1)
+        if is_useful_email(email): return email
+    text = re.sub(r"<[^>]+>", " ", text)
+    for pat, rep in [(r"\s*\(at\)\s*", "@"), (r"\s*\[at\]\s*", "@"),
+                     (r"\s+at\s+", "@"), (r"\s*\(dot\)\s*", "."),
+                     (r"\s*\[dot\]\s*", "."), (r"\s+dot\s+", ".")]:
+        text = re.sub(pat, rep, text, flags=re.I)
+    text = re.sub(r"\s+", "", text)
+    match = re.search(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)
+    if match and is_useful_email(match.group(0)):
+        return match.group(0)
+    return None
+
+
+def lookup_email_requests(website_url: str) -> str:
+    """Try multiple contact page URLs until email is found."""
+    if not website_url or str(website_url) == 'nan' or website_url == '':
+        return ""
+    base = website_url.rstrip("/")
+    for path in CONTACT_PATHS:
+        url = f"{base}{path}" if path else base
+        html = fetch_page_requests(url)
+        if html:
+            email = extract_email_from_html(html)
+            if email:
+                return email
+    return ""
+
 
 def enrich_emails_from_company_websites(records: list[SupplierRecord]):
+    """Visit company websites to find emails (requests-based, same as EC21/MIC)."""
     if not ENABLE_WEBSITE_EMAIL_ENRICHMENT:
         return
+    
     candidates = [r for r in records if r.website_url and not r.email][:MAX_WEBSITE_EMAIL_LOOKUPS]
     if not candidates:
         return
+    
     print(f"\n[WEBSITE-EMAIL] Looking for emails on {len(candidates)} company websites...")
-
-    def lookup_email(record):
-        base = record.website_url.rstrip("/")
-        seen = set()
-        for path in WEBSITE_EMAIL_PATHS:
-            url = f"{base}{path}" if path else base
-            if url in seen:
-                continue
-            seen.add(url)
-            try:
-                _, html = fetch_html(url)
-                if html:
-                    email = extract_email_from_text_flexible(html)
-                    email = clean_email(email)
-                    if email and is_useful_email(email):
-                        return record, email
-            except:
-                continue
-        return record, ""
-
-    updates = 0
+    print(f"  Strategy: Footer → Homepage → {len(CONTACT_PATHS)} contact paths | Timeout: {WEBSITE_TIMEOUT}s")
+    
+    found = 0
+    skipped = 0
+    emails_since_save = 0
+    
     with ThreadPoolExecutor(max_workers=WEBSITE_EMAIL_WORKERS) as executor:
-        futures = {executor.submit(lookup_email, r): r for r in candidates}
+        futures = {executor.submit(lookup_email_requests, r.website_url): r for r in candidates}
+        total = len(candidates)
+        
         for i, future in enumerate(as_completed(futures), 1):
-            record, email = future.result()
-            if email and not record.email:
+            record = futures[future]
+            try:
+                email = future.result(timeout=WEBSITE_TIMEOUT + 5)
+            except FutureTimeoutError:
+                skipped += 1
+                continue
+            
+            if email:
                 record.email = email
-                updates += 1
-            if i % 25 == 0:
-                print(f"  Progress: {i}/{len(candidates)}, found {updates} emails")
-    print(f"  Total emails found: {updates}")
+                found += 1
+                emails_since_save += 1
+                print(f"  [{found}] {record.company_name[:40]} → {email}")
+                
+                if emails_since_save >= AUTOSAVE_EVERY_NEW_EMAILS:
+                    save_checkpoint(records, PARTIAL_OUTPUT_CSV)
+                    print(f"  [SAVE] {found} emails → {PARTIAL_OUTPUT_CSV}")
+                    emails_since_save = 0
+            
+            if i % 50 == 0:
+                print(f"  Progress: {i}/{total}, found {found}, skipped {skipped}")
+    
+    save_checkpoint(records, PARTIAL_OUTPUT_CSV)
+    print(f"  Total emails found: {found} ({skipped} timed out)")
 
 
 # ===== SAVE FUNCTIONS =====
@@ -1130,25 +946,22 @@ def scrape_tradewheel():
     print("=" * 60)
     print("Tradewheel Cosmetic Packaging Supplier Scraper")
     print(f"Target: {TARGET_SUPPLIERS} suppliers")
+    print(f"Email: requests-based, {len(CONTACT_PATHS)} contact paths, {WEBSITE_TIMEOUT}s timeout")
     print("=" * 60)
 
     try:
         with SearchPageBrowser() as search_browser:
             if search_browser.enabled:
-                print(
-                    f"[SEARCH] Using persistent browser session for listings ({SEARCH_BROWSER_PROFILE_DIR})."
-                )
+                print(f"[SEARCH] Using persistent browser session for listings.")
             else:
-                print("[SEARCH] Browser session unavailable; falling back to fetcher for listings.")
+                print("[SEARCH] Browser session unavailable; falling back to fetcher.")
+            
             for keyword in KEYWORDS:
-                if len(all_records) >= TARGET_SUPPLIERS:
-                    break
+                if len(all_records) >= TARGET_SUPPLIERS: break
                 for country in COUNTRIES:
-                    if len(all_records) >= TARGET_SUPPLIERS:
-                        break
+                    if len(all_records) >= TARGET_SUPPLIERS: break
                     for page in range(1, MAX_PAGES_PER_QUERY + 1):
-                        if len(all_records) >= TARGET_SUPPLIERS:
-                            break
+                        if len(all_records) >= TARGET_SUPPLIERS: break
 
                         url = build_search_url(keyword, country, page)
                         try:
@@ -1160,26 +973,20 @@ def scrape_tradewheel():
                             random_delay()
                             continue
 
-                        if status == 404 or not html:
-                            break
-
+                        if status == 404 or not html: break
                         anchors = parse_company_anchors(html)
-                        if not anchors:
-                            break
+                        if not anchors: break
 
                         page_new = 0
                         for anchor in anchors:
                             norm = re.sub(r"\s+", " ", anchor["name"]).strip().lower()
-                            if not norm or norm in seen_names:
-                                continue
-
+                            if not norm or norm in seen_names: continue
                             record = extract_company_record(anchor, keyword)
                             record.country = country
                             seen_names.add(norm)
                             all_records.append(record)
                             page_new += 1
                             save_counter += 1
-
                             if save_counter >= AUTOSAVE_EVERY_NEW_RECORDS:
                                 save_checkpoint(all_records, PARTIAL_OUTPUT_CSV)
                                 print(f"[CHECKPOINT] Saved {len(all_records)} records")
@@ -1195,7 +1002,7 @@ def scrape_tradewheel():
         print(f"\n[ERROR] {e}")
         save_checkpoint(all_records, PARTIAL_OUTPUT_CSV)
 
-    # Phase 2: Logged-in enrichment
+    # Phase 2: Logged-in enrichment (Playwright - unchanged)
     if all_records and ENABLE_LOGGED_IN_ENRICHMENT:
         print("\n[AUTH] Starting logged-in enrichment...")
         try:
@@ -1204,7 +1011,7 @@ def scrape_tradewheel():
             print(f"[AUTH] Error: {e}")
         save_checkpoint(all_records, PARTIAL_OUTPUT_CSV)
 
-    # Phase 3: Website email enrichment
+    # Phase 3: Website email enrichment (NEW: requests-based)
     if all_records and ENABLE_WEBSITE_EMAIL_ENRICHMENT:
         print("\n[WEBSITE] Starting website email enrichment...")
         try:
