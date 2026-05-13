@@ -15,3 +15,7 @@ server/__pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+.mic_contact_playwright_profile
+.tradewheel_search_profile
+.europages_playwright_profile
+runs/

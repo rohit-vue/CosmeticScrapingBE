@@ -1,2 +1,5 @@
-2026/05/09-10:56:49.121 15f4 Creating DB C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Session Storage since it was missing.
-2026/05/09-10:56:49.224 15f4 Reusing MANIFEST C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Session Storage/MANIFEST-000001
+2026/05/12-17:42:03.087 5674 Reusing MANIFEST C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Session Storage/MANIFEST-000001
+2026/05/12-17:42:03.954 5674 Recovering log #4
+2026/05/12-17:42:04.119 5674 Reusing old log C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Session Storage/000004.log 
+2026/05/12-17:50:22.573 5b9c Level-0 table #8: started
+2026/05/12-17:50:23.012 5b9c Level-0 table #8: 12992 bytes OK

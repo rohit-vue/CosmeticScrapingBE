@@ -1,11 +1,18 @@
-2026/05/09-10:56:49.111 1ad8 Creating DB C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Local Storage\leveldb since it was missing.
-2026/05/09-10:56:49.272 1ad8 Reusing MANIFEST C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Local Storage\leveldb/MANIFEST-000001
-2026/05/09-11:00:54.436 15f4 Level-0 table #5: started
-2026/05/09-11:00:54.464 15f4 Level-0 table #5: 18571 bytes OK
-2026/05/09-11:00:54.483 15f4 Delete type=0 #3
-2026/05/09-11:03:46.357 15f4 Level-0 table #7: started
-2026/05/09-11:03:46.383 15f4 Level-0 table #7: 18067 bytes OK
-2026/05/09-11:03:46.390 15f4 Delete type=0 #4
-2026/05/09-11:07:32.350 15f4 Level-0 table #9: started
-2026/05/09-11:07:32.381 15f4 Level-0 table #9: 20170 bytes OK
-2026/05/09-11:07:32.401 15f4 Delete type=0 #6
+2026/05/12-17:42:03.056 5b9c Reusing MANIFEST C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/05/12-17:42:03.221 5b9c Recovering log #11
+2026/05/12-17:42:04.079 5b9c Reusing old log C:\Users\Etech\Desktop\Scraping full\CosmeticScraping\.mic_contact_playwright_profile\Default\Local Storage\leveldb/000011.log 
+2026/05/12-17:44:24.326 5674 Level-0 table #15: started
+2026/05/12-17:44:24.352 5674 Level-0 table #15: 17864 bytes OK
+2026/05/12-17:44:24.360 5674 Delete type=0 #11
+2026/05/12-17:50:06.716 5b9c Level-0 table #17: started
+2026/05/12-17:50:06.771 5b9c Level-0 table #17: 17874 bytes OK
+2026/05/12-17:50:06.783 5b9c Delete type=0 #14
+2026/05/12-17:50:06.791 5b9c Compacting 4@0 + 1@1 files
+2026/05/12-17:50:06.818 5b9c Generated table #18@0: 884 keys, 53042 bytes
+2026/05/12-17:50:06.819 5b9c Compacted 4@0 + 1@1 files => 53042 bytes
+2026/05/12-17:50:06.821 5b9c compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/05/12-17:50:06.830 5b9c Delete type=2 #7
+2026/05/12-17:50:06.831 5b9c Delete type=2 #9
+2026/05/12-17:50:06.831 5b9c Delete type=2 #12
+2026/05/12-17:50:06.841 5b9c Delete type=2 #15
+2026/05/12-17:50:06.842 5b9c Delete type=2 #17

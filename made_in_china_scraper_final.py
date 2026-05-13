@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
+from ai_supplier_filter import apply_ai_filter_to_records
 from scraper_runtime_config import env_int, env_list
 
 try:
@@ -37,27 +38,78 @@ except ImportError:
 
 # ===== KEYWORDS & COUNTRIES (STANDALONE) =====
 KEYWORDS = [
-    "cosmetics",
-    "cosmetic packaging",
-    "cosmetic bottles",
-    "cosmetic tubes",
-    "cosmetic jars",
-    "plastic packaging",
-    "glass packaging",
-    "lotion pumps",
-    "airless pumps",
+    # TUBES
+    "cosmetic tube",
+    "squeeze tube cosmetic",
+    "laminated tube cosmetic",
+    "plastic cosmetic tube",
+    "hand cream tube",
+    "lip balm tube",
+    "lotion tube packaging",
+    "bb cream tube",
+    
+    # JARS & CONTAINERS
+    "cosmetic jar",
+    "cream jar packaging",
+    "skincare jar supplier",
+    "glass cosmetic jar",
+    "airless jar cosmetic",
+    
+    # BOTTLES
+    "cosmetic bottle supplier",
+    "lotion bottle packaging",
+    "serum bottle cosmetic",
+    "airless bottle cosmetic",
+    "pump bottle cosmetic",
+    
+    # PUMPS & DISPENSERS
+    "lotion pump dispenser",
+    "airless pump bottle",
+    "cosmetic pump packaging",
+    "foam pump cosmetic",
+    
+    # CAPS & CLOSURES
+    "cosmetic cap supplier",
+    "jar cap packaging",
+    "bottle cap cosmetic",
+    "flip top cap cosmetic",
+    "disc top cap",
+    "plastic closure cosmetic",
+    "PP cap supplier",
+    
+    # GENERAL PACKAGING
+    "cosmetic packaging supplier",
+    "skincare packaging manufacturer",
+    "beauty packaging supplier",
+    "primary packaging cosmetics",
+    "cosmetic packaging OEM",
 ]
 
 COUNTRIES = [
+    "Russia",
+    "Ukraine",
+    "Poland",
+    "Czech Republic",
+    "Hungary",
+    "Romania",
+    "Bulgaria",
+    "Belarus",
+    "Serbia",
+    "Croatia",
+    "Slovakia",
+    "Slovenia",
+    "Lithuania",
+    "Latvia",
+    "Turkey",
     "China",
-     "South Korea",
-     "Taiwan",
-     "Japan",
-     "Vietnam",
-     "Thailand",
-     "Singapore",
-     "Malaysia",
-     "Hong Kong",
+    "South Korea",
+    "Taiwan",
+    "Japan",
+    "Vietnam",
+    "Thailand",
+    "Singapore",
+    "Malaysia",
+    "Hong Kong",
 ]
 
 # ===== CONFIGURATION =====
@@ -72,16 +124,22 @@ OUTPUT_CSV = "made_in_china_suppliers_phase1_raw.csv"
 CLEANED_CSV = "made_in_china_suppliers_cleaned.csv"
 PARTIAL_SCRAPE_CSV = "made_in_china_suppliers_partial_scrape.csv"
 PARTIAL_ENRICH_CSV = "made_in_china_suppliers_partial_enrichment.csv"
-TARGET_SUPPLIERS = 9000
+TARGET_SUPPLIERS = 5000
 AUTOSAVE_EVERY_NEW_RECORDS = 10
-AUTOSAVE_EVERY_NEW_EMAILS = 10
+AUTOSAVE_EVERY_NEW_EMAILS = 1
 PROFILE_ENRICH_DURING_SCRAPE = False
 ENABLE_CONTACT_PAGE_ENRICHMENT = True
-MAX_CONTACT_ENRICHMENTS = TARGET_SUPPLIERS
+MAX_CONTACT_ENRICHMENTS = 0
 ENABLE_WEBSITE_EMAIL_ENRICHMENT = True
-MAX_WEBSITE_EMAIL_LOOKUPS = TARGET_SUPPLIERS
+MAX_WEBSITE_EMAIL_LOOKUPS = 0
 WEBSITE_EMAIL_WORKERS = 10
 WEBSITE_TIMEOUT = 15
+ENABLE_AI_FILTERING = True
+AI_VERIFIED_CSV = "made_in_china_ai_verified.csv"
+AI_REJECTED_CSV = "made_in_china_ai_rejected.csv"
+AI_CHECKPOINT_CSV = "made_in_china_ai_checkpoint.csv"
+AI_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "20"))
+AI_CONCURRENT = int(os.getenv("AI_CONCURRENT", "3"))
 
 # Extended contact paths
 CONTACT_PATHS = [
@@ -132,8 +190,8 @@ KEYWORDS = env_list("SCRAPER_KEYWORDS", KEYWORDS)
 COUNTRIES = env_list("SCRAPER_COUNTRIES", COUNTRIES)
 DEFAULT_COUNTRY = COUNTRIES[0] if COUNTRIES else DEFAULT_COUNTRY
 TARGET_SUPPLIERS = env_int("SCRAPER_TARGET_SUPPLIERS", TARGET_SUPPLIERS)
-MAX_CONTACT_ENRICHMENTS = TARGET_SUPPLIERS
-MAX_WEBSITE_EMAIL_LOOKUPS = TARGET_SUPPLIERS
+MAX_CONTACT_ENRICHMENTS = env_int("MADE_IN_CHINA_MAX_CONTACT_ENRICHMENTS", MAX_CONTACT_ENRICHMENTS)
+MAX_WEBSITE_EMAIL_LOOKUPS = env_int("MADE_IN_CHINA_MAX_EMAIL_LOOKUPS", MAX_WEBSITE_EMAIL_LOOKUPS)
 
 JUNK_EMAIL_PHRASES = [
     "cloudflare", "404", "notfound", "blocked", "error",
@@ -150,6 +208,11 @@ class SupplierRecord:
     email: str = ""
     source_directory: str = SOURCE_DIRECTORY
     profile_url: str = ""
+    company_description: str = ""
+    is_target_supplier: bool = False
+    confidence: float = 0.0
+    ai_reason: str = ""
+    ai_target_keywords: str = ""
 
 
 def random_delay() -> None:
@@ -169,6 +232,36 @@ def strip_tags(text: str) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", unescape(text))).strip()
+
+
+def extract_main_products_description(html: str) -> str:
+    """Extract Made-in-China 'Main Products' from the company profile."""
+    if not html:
+        return ""
+    direct_pattern = (
+        r'<div[^>]*class=["\'][^"\']*\bsr-comProfile-label\b[^"\']*["\'][^>]*>\s*'
+        r'Main\s+Products:?\s*</div>\s*'
+        r'<div[^>]*class=["\'][^"\']*\bsr-comProfile-fields\b[^"\']*["\'][^>]*>(.*?)</div>'
+    )
+    match = re.search(direct_pattern, html, re.I | re.S)
+    if match:
+        text = strip_tags(match.group(1))
+        if text:
+            return f"Main Products: {text}"
+    item_pattern = r'<div[^>]*class=["\'][^"\']*\bsr-comProfile-item\b[^"\']*["\'][^>]*>(.*?)</div>\s*</div>'
+    for item_html in re.findall(item_pattern, html, re.I | re.S):
+        if "main products" not in strip_tags(item_html).lower():
+            continue
+        fields_match = re.search(
+            r'<div[^>]*class=["\'][^"\']*\bsr-comProfile-fields\b[^"\']*["\'][^>]*>(.*?)</div>',
+            item_html,
+            re.I | re.S,
+        )
+        if fields_match:
+            text = strip_tags(fields_match.group(1))
+            if text:
+                return f"Main Products: {text}"
+    return ""
 
 
 def normalize_url(url: str) -> str:
@@ -398,6 +491,35 @@ def extract_contact_page_url(profile_html: str, profile_url: str) -> str:
     return f"{profile_url.rstrip('/')}/contact-info.html"
 
 
+def extract_about_page_url(profile_html: str, profile_url: str) -> str:
+    same_host_company_links = []
+    for href, text in re.findall(
+        r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', profile_html, flags=re.I | re.S,
+    ):
+        label = strip_tags(text).lower()
+        normalized = normalize_url(href)
+        if urlparse(normalized).netloc != urlparse(profile_url).netloc:
+            continue
+        if "about us" in label:
+            return normalized
+        if "/company-" in normalized.lower():
+            same_host_company_links.append(normalized)
+    return same_host_company_links[0] if same_host_company_links else ""
+
+
+def extract_about_page_candidates(profile_html: str, profile_url: str) -> list[str]:
+    candidates = []
+    primary = extract_about_page_url(profile_html, profile_url)
+    if primary:
+        candidates.append(primary)
+    profile_host = urlparse(profile_url).netloc
+    for href in re.findall(r'href=["\']([^"\']*company-[^"\']+\.html)["\']', profile_html, re.I):
+        normalized = normalize_url(href)
+        if urlparse(normalized).netloc == profile_host and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
 def extract_website_link_from_contact_html(contact_html: str) -> str:
     match = re.search(
         r'<a[^>]+class=["\'][^"\']*\blink-web\b[^"\']*["\'][^>]+href=["\']([^"\']+)["\']',
@@ -552,7 +674,7 @@ def enrich_from_contact_page_playwright(page, record: SupplierRecord) -> None:
     profile_url = (record.profile_url or "").strip()
     if not profile_url or not page:
         return
-    if record.website_url and record.email:
+    if record.website_url and record.email and record.company_description:
         return
     timeout = max(10_000, int(CONTACT_ENRICHMENT_BROWSER_TIMEOUT_MS))
     try:
@@ -564,6 +686,22 @@ def enrich_from_contact_page_playwright(page, record: SupplierRecord) -> None:
         profile_html = page.content()
     except Exception:
         return
+    description = extract_main_products_description(profile_html)
+    if description and not record.company_description:
+        record.company_description = description
+    for about_url in extract_about_page_candidates(profile_html, profile_url):
+        if record.company_description:
+            break
+        mic_site_gap()
+        try:
+            page.goto(about_url, wait_until="domcontentloaded", timeout=timeout)
+            page.wait_for_timeout(600)
+            about_html = page.content()
+            description = extract_main_products_description(about_html)
+            if description:
+                record.company_description = description
+        except Exception:
+            pass
     contact_url = extract_contact_page_url(profile_html, profile_url)
     mic_site_gap()
     try:
@@ -581,12 +719,26 @@ def enrich_from_contact_page(fetcher: ScraplingStealthFetcher, record: SupplierR
     profile_url = (record.profile_url or "").strip()
     if not profile_url:
         return
-    if record.website_url and record.email:
+    if record.website_url and record.email and record.company_description:
         return
     try:
         _, profile_html = fetch_html(fetcher, profile_url)
     except Exception:
         return
+    description = extract_main_products_description(profile_html)
+    if description and not record.company_description:
+        record.company_description = description
+    for about_url in extract_about_page_candidates(profile_html, profile_url):
+        if record.company_description:
+            break
+        mic_site_gap()
+        try:
+            _, about_html = fetch_html(fetcher, about_url)
+            description = extract_main_products_description(about_html)
+            if description:
+                record.company_description = description
+        except Exception:
+            pass
     contact_url = extract_contact_page_url(profile_html, profile_url)
     mic_site_gap()
     try:
@@ -605,12 +757,12 @@ def _run_contact_loop_playwright(page, records: list[SupplierRecord]) -> None:
     updated = 0
     new_websites_since_checkpoint = 0
     for record in records:
-        if attempted >= MAX_CONTACT_ENRICHMENTS:
+        if MAX_CONTACT_ENRICHMENTS > 0 and attempted >= MAX_CONTACT_ENRICHMENTS:
             print(f"[CONTACT] Reached contact enrichment cap ({MAX_CONTACT_ENRICHMENTS}).")
             break
         if not record.profile_url:
             continue
-        if record.website_url and record.email:
+        if record.website_url and record.email and record.company_description:
             continue
         before = (record.website_url, record.email)
         had_site_before = bool((record.website_url or "").strip())
@@ -650,12 +802,12 @@ def run_contact_page_enrichment(records: list[SupplierRecord]) -> None:
     updated = 0
     new_websites_since_checkpoint = 0
     for record in records:
-        if attempted >= MAX_CONTACT_ENRICHMENTS:
+        if MAX_CONTACT_ENRICHMENTS > 0 and attempted >= MAX_CONTACT_ENRICHMENTS:
             print(f"[CONTACT] Reached contact enrichment cap ({MAX_CONTACT_ENRICHMENTS}).")
             break
         if not record.profile_url:
             continue
-        if record.website_url and record.email:
+        if record.website_url and record.email and record.company_description:
             continue
         before = (record.website_url, record.email)
         had_site_before = bool((record.website_url or "").strip())
@@ -680,7 +832,9 @@ def enrich_emails_from_company_websites(
 ) -> None:
     if not ENABLE_WEBSITE_EMAIL_ENRICHMENT:
         return
-    candidates = [r for r in records if r.website_url and not r.email][:max_lookups]
+    candidates = [r for r in records if r.website_url and not r.email]
+    if max_lookups > 0:
+        candidates = candidates[:max_lookups]
     if not candidates:
         print("  No companies need email enrichment")
         return
@@ -817,8 +971,22 @@ def scrape_made_in_china() -> pd.DataFrame:
         save_scrape_checkpoint(all_records, PARTIAL_SCRAPE_CSV)
         print(f"[PHASE 2 DONE] Contact-page enrichment complete.")
 
+    if all_records and ENABLE_AI_FILTERING:
+        print("\n[PHASE 3] Starting AI filtering...")
+        all_records = apply_ai_filter_to_records(
+            all_records,
+            keywords=KEYWORDS,
+            source_name=SOURCE_DIRECTORY,
+            verified_csv=AI_VERIFIED_CSV,
+            rejected_csv=AI_REJECTED_CSV,
+            checkpoint_csv=AI_CHECKPOINT_CSV,
+            batch_size=AI_BATCH_SIZE,
+            concurrent=AI_CONCURRENT,
+        )
+        save_enrich_checkpoint(all_records, PARTIAL_ENRICH_CSV)
+
     if all_records and ENABLE_WEBSITE_EMAIL_ENRICHMENT:
-        print("\n[PHASE 3] Starting email enrichment...")
+        print("\n[PHASE 4] Starting email enrichment for AI-verified companies...")
         enrich_emails_from_company_websites(all_records)
         save_enrich_checkpoint(all_records, PARTIAL_ENRICH_CSV)
 

@@ -18,6 +18,7 @@ from urllib.parse import urlencode, urlparse
 
 import pandas as pd
 import requests
+from ai_supplier_filter import apply_ai_filter_to_records
 from proxy_service import (
     ProxyEndpoint,
     ProxyExhaustedError,
@@ -37,18 +38,69 @@ except ImportError:
 
 
 KEYWORDS = [
-    "cosmetic packaging",
-    "cosmetic bottles",
-    "cosmetic tubes",
-    "cosmetic jars",
-    "plastic packaging",
-    "glass packaging",
-    "lotion pumps",
-    "airless pumps",
-    "cosmetics"
+    # TUBES
+    "cosmetic tube",
+    "squeeze tube cosmetic",
+    "laminated tube cosmetic",
+    "plastic cosmetic tube",
+    "hand cream tube",
+    "lip balm tube",
+    "lotion tube packaging",
+    "bb cream tube",
+    
+    # JARS & CONTAINERS
+    "cosmetic jar",
+    "cream jar packaging",
+    "skincare jar supplier",
+    "glass cosmetic jar",
+    "airless jar cosmetic",
+    
+    # BOTTLES
+    "cosmetic bottle supplier",
+    "lotion bottle packaging",
+    "serum bottle cosmetic",
+    "airless bottle cosmetic",
+    "pump bottle cosmetic",
+    
+    # PUMPS & DISPENSERS
+    "lotion pump dispenser",
+    "airless pump bottle",
+    "cosmetic pump packaging",
+    "foam pump cosmetic",
+    
+    # CAPS & CLOSURES
+    "cosmetic cap supplier",
+    "jar cap packaging",
+    "bottle cap cosmetic",
+    "flip top cap cosmetic",
+    "disc top cap",
+    "plastic closure cosmetic",
+    "PP cap supplier",
+    
+    # GENERAL PACKAGING
+    "cosmetic packaging supplier",
+    "skincare packaging manufacturer",
+    "beauty packaging supplier",
+    "primary packaging cosmetics",
+    "cosmetic packaging OEM",
 ]
 
 COUNTRIES = [
+    "Russia",
+    "Ukraine",
+    "Poland",
+    "Czech Republic",
+    "Hungary",
+    "Romania",
+    "Bulgaria",
+    "Belarus",
+    "Serbia",
+    "Croatia",
+    "Slovakia",
+    "Slovenia",
+    "Lithuania",
+    "Latvia",
+    "Turkey",
     "China",
     "South Korea",
     "Taiwan",
@@ -75,7 +127,7 @@ ENABLE_LOGGED_IN_ENRICHMENT = True
 PAUSE_FOR_MANUAL_LOGIN = True
 AUTH_BROWSER_PROFILE_DIR = ".tradewheel_auth_profile"
 AUTH_BROWSER_HEADLESS = False
-MAX_LOGGED_IN_ENRICHMENTS = 800
+MAX_LOGGED_IN_ENRICHMENTS = 0
 PLAYWRIGHT_AUTH_CHANNEL = "msedge"
 PLAYWRIGHT_AUTH_EXTRA_ARGS = ["--disable-blink-features=AutomationControlled"]
 TRADEWHEEL_EMAIL_ENV = "TRADEWHEEL_EMAIL"
@@ -91,10 +143,16 @@ PLAYWRIGHT_SEARCH_EXTRA_ARGS = ["--disable-blink-features=AutomationControlled"]
 
 # WEBSITE EMAIL ENRICHMENT (UPGRADED - requests-based, same as EC21/MIC)
 ENABLE_WEBSITE_EMAIL_ENRICHMENT = True
-MAX_WEBSITE_EMAIL_LOOKUPS = TARGET_SUPPLIERS
+MAX_WEBSITE_EMAIL_LOOKUPS = 0
 WEBSITE_EMAIL_WORKERS = 10
 WEBSITE_TIMEOUT = 15
-AUTOSAVE_EVERY_NEW_EMAILS = 10
+AUTOSAVE_EVERY_NEW_EMAILS = 1
+ENABLE_AI_FILTERING = True
+AI_VERIFIED_CSV = "tradewheel_ai_verified.csv"
+AI_REJECTED_CSV = "tradewheel_ai_rejected.csv"
+AI_CHECKPOINT_CSV = "tradewheel_ai_checkpoint.csv"
+AI_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "20"))
+AI_CONCURRENT = int(os.getenv("AI_CONCURRENT", "3"))
 
 CONTACT_PATHS = [
     "", "/contact", "/contact-us", "/contactus", "/contact.html",
@@ -130,6 +188,8 @@ COUNTRY_IDS = {
 KEYWORDS = env_list("SCRAPER_KEYWORDS", KEYWORDS)
 COUNTRIES = env_list("SCRAPER_COUNTRIES", COUNTRIES)
 TARGET_SUPPLIERS = env_int("SCRAPER_TARGET_SUPPLIERS", TARGET_SUPPLIERS)
+MAX_LOGGED_IN_ENRICHMENTS = env_int("TRADEWHEEL_MAX_LOGGED_IN_ENRICHMENTS", MAX_LOGGED_IN_ENRICHMENTS)
+MAX_WEBSITE_EMAIL_LOOKUPS = env_int("TRADEWHEEL_MAX_EMAIL_LOOKUPS", MAX_WEBSITE_EMAIL_LOOKUPS)
 
 PROXY_POOL = create_proxy_pool("tradewheel")
 
@@ -296,6 +356,11 @@ class SupplierRecord:
     email: str = ""
     source_directory: str = SOURCE_DIRECTORY
     profile_url: str = ""
+    company_description: str = ""
+    is_target_supplier: bool = False
+    confidence: float = 0.0
+    ai_reason: str = ""
+    ai_target_keywords: str = ""
 
 
 def random_delay():
@@ -591,6 +656,19 @@ def extract_email_from_profile_table(profile_html: str) -> str:
     return ""
 
 
+def extract_main_products_from_profile(profile_html: str) -> str:
+    row_matches = re.findall(
+        r"<tr[^>]*>\s*<td[^>]*>\s*Main\s+Products\s*:?\s*</td>\s*<td[^>]*>(.*?)</td>\s*</tr>",
+        profile_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for value_cell in row_matches:
+        products = strip_tags(value_cell)
+        if products:
+            return f"Main Products: {products}"
+    return ""
+
+
 def parse_company_anchors(html: str) -> list[dict[str, str]]:
     anchors = []
     seen = set()
@@ -756,11 +834,15 @@ class LoggedInContactEnricher:
             if self.playwright: self.playwright.stop()
 
     def can_run(self) -> bool:
-        return self.enabled and self.page is not None and self.attempts < self.max_attempts
+        return (
+            self.enabled
+            and self.page is not None
+            and (self.max_attempts <= 0 or self.attempts < self.max_attempts)
+        )
 
-    def enrich(self, profile_url: str) -> tuple[str, str]:
+    def enrich(self, profile_url: str) -> tuple[str, str, str]:
         if not self.can_run() or not profile_url:
-            return "", ""
+            return "", "", ""
         self.attempts += 1
         try:
             self._auth_goto(profile_url, 90000)
@@ -776,7 +858,7 @@ class LoggedInContactEnricher:
                         link.click(timeout=2500)
                         self.page.wait_for_timeout(1200)
                 except: continue
-        except: return "", ""
+        except: return "", "", ""
         html = ""
         for _ in range(3):
             try:
@@ -784,10 +866,11 @@ class LoggedInContactEnricher:
                 html = self.page.content()
                 if html: break
             except: self.page.wait_for_timeout(800)
-        if not html: return "", ""
+        if not html: return "", "", ""
         website_url = extract_external_website_from_profile(html)
         email = extract_email_from_profile_table(html)
-        return website_url, email
+        description = extract_main_products_from_profile(html)
+        return website_url, email, description
 
 
 def run_logged_in_enrichment(records: list[SupplierRecord], max_records: Optional[int] = None):
@@ -798,15 +881,18 @@ def run_logged_in_enrichment(records: list[SupplierRecord], max_records: Optiona
         updated = 0
         for record in records:
             if max_records and processed >= max_records: break
-            if record.website_url and record.email: continue
+            if record.website_url and record.email and record.company_description: continue
             if not auth_enricher.can_run(): break
-            website_url, email = auth_enricher.enrich(record.profile_url)
+            website_url, email, description = auth_enricher.enrich(record.profile_url)
             changed = False
             if website_url and not record.website_url:
                 record.website_url = website_url
                 changed = True
             if email and not record.email and is_useful_email(email):
                 record.email = email
+                changed = True
+            if description and not record.company_description:
+                record.company_description = description
                 changed = True
             processed += 1
             if changed: updated += 1
@@ -884,7 +970,9 @@ def enrich_emails_from_company_websites(records: list[SupplierRecord]):
     if not ENABLE_WEBSITE_EMAIL_ENRICHMENT:
         return
     
-    candidates = [r for r in records if r.website_url and not r.email][:MAX_WEBSITE_EMAIL_LOOKUPS]
+    candidates = [r for r in records if r.website_url and not r.email]
+    if MAX_WEBSITE_EMAIL_LOOKUPS > 0:
+        candidates = candidates[:MAX_WEBSITE_EMAIL_LOOKUPS]
     if not candidates:
         return
     
@@ -1011,9 +1099,28 @@ def scrape_tradewheel():
             print(f"[AUTH] Error: {e}")
         save_checkpoint(all_records, PARTIAL_OUTPUT_CSV)
 
+    if all_records and ENABLE_AI_FILTERING:
+        print("\n[AI] Starting target-keyword verification...")
+        try:
+            all_records = apply_ai_filter_to_records(
+                all_records,
+                keywords=KEYWORDS,
+                source_name=SOURCE_DIRECTORY,
+                verified_csv=AI_VERIFIED_CSV,
+                rejected_csv=AI_REJECTED_CSV,
+                checkpoint_csv=AI_CHECKPOINT_CSV,
+                batch_size=AI_BATCH_SIZE,
+                concurrent=AI_CONCURRENT,
+            )
+        except Exception as e:
+            print(f"[AI] Error: {e}")
+            save_checkpoint(all_records, PARTIAL_OUTPUT_CSV)
+            raise
+        save_checkpoint(all_records, PARTIAL_OUTPUT_CSV)
+
     # Phase 3: Website email enrichment (NEW: requests-based)
     if all_records and ENABLE_WEBSITE_EMAIL_ENRICHMENT:
-        print("\n[WEBSITE] Starting website email enrichment...")
+        print("\n[WEBSITE] Starting website email enrichment for AI-verified companies...")
         try:
             enrich_emails_from_company_websites(all_records)
         except Exception as e:

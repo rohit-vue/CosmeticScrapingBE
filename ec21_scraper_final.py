@@ -5,6 +5,7 @@ Uses requests for email enrichment with proper timeout control.
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import time
@@ -16,6 +17,7 @@ from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
+from ai_supplier_filter import apply_ai_filter_to_records
 from scraper_runtime_config import env_int, env_list
 from scrapling import StealthyFetcher as ScraplingStealthFetcher
 
@@ -30,12 +32,18 @@ OUTPUT_CSV = "ec21_suppliers_phase1_raw.csv"
 CLEANED_CSV = "ec21_suppliers_cleaned.csv"
 PARTIAL_SCRAPE_CSV = "ec21_suppliers_scrape_progress.csv"
 PARTIAL_ENRICH_CSV = "ec21_suppliers_enrich_progress.csv"
-TARGET_SUPPLIERS = 2000
+TARGET_SUPPLIERS = 5000
 AUTOSAVE_EVERY_NEW_RECORDS = 5
-AUTOSAVE_EVERY_NEW_EMAILS = 5
+AUTOSAVE_EVERY_NEW_EMAILS = 1
 PROFILE_WORKERS = 3
 WEBSITE_EMAIL_WORKERS = 5
 WEBSITE_TIMEOUT = 15 # seconds per page
+ENABLE_AI_FILTERING = True
+AI_VERIFIED_CSV = "ec21_ai_verified.csv"
+AI_REJECTED_CSV = "ec21_ai_rejected.csv"
+AI_CHECKPOINT_CSV = "ec21_ai_checkpoint.csv"
+AI_BATCH_SIZE = int(os.getenv("AI_BATCH_SIZE", "20"))
+AI_CONCURRENT = int(os.getenv("AI_CONCURRENT", "3"))
 
 # Contact pages to try (in order - stops at first success)
 CONTACT_PATHS = [
@@ -65,17 +73,69 @@ CONTACT_PATHS = [
 ]
 
 CATEGORIES = [
-    "cosmetics",
-    "cosmetic-packaging",
-    "cosmetic-bottles",
-    "cosmetic-tubes",
-    "cosmetic-jars",
-    "plastic-packaging",
-    "glass-packaging",
-    "packaging-materials",
+    # TUBES
+    "cosmetic tube",
+    "squeeze tube cosmetic",
+    "laminated tube cosmetic",
+    "plastic cosmetic tube",
+    "hand cream tube",
+    "lip balm tube",
+    "lotion tube packaging",
+    "bb cream tube",
+    
+    # JARS & CONTAINERS
+    "cosmetic jar",
+    "cream jar packaging",
+    "skincare jar supplier",
+    "glass cosmetic jar",
+    "airless jar cosmetic",
+    
+    # BOTTLES
+    "cosmetic bottle supplier",
+    "lotion bottle packaging",
+    "serum bottle cosmetic",
+    "airless bottle cosmetic",
+    "pump bottle cosmetic",
+    
+    # PUMPS & DISPENSERS
+    "lotion pump dispenser",
+    "airless pump bottle",
+    "cosmetic pump packaging",
+    "foam pump cosmetic",
+    
+    # CAPS & CLOSURES
+    "cosmetic cap supplier",
+    "jar cap packaging",
+    "bottle cap cosmetic",
+    "flip top cap cosmetic",
+    "disc top cap",
+    "plastic closure cosmetic",
+    "PP cap supplier",
+    
+    # GENERAL PACKAGING
+    "cosmetic packaging supplier",
+    "skincare packaging manufacturer",
+    "beauty packaging supplier",
+    "primary packaging cosmetics",
+    "cosmetic packaging OEM",
 ]
 
 COUNTRIES = {
+    "Russia": "RU",
+    "Ukraine": "UA",
+    "Poland": "PL",
+    "Czech Republic": "CZ",
+    "Hungary": "HU",
+    "Romania": "RO",
+    "Bulgaria": "BG",
+    "Belarus": "BY",
+    "Serbia": "RS",
+    "Croatia": "HR",
+    "Slovakia": "SK",
+    "Slovenia": "SI",
+    "Lithuania": "LT",
+    "Latvia": "LV",
+    "Turkey": "TR",
     "China": "CN",
     "South Korea": "KR",
     "Taiwan": "TW",
@@ -100,6 +160,15 @@ PACKAGING_KEYWORDS = [
     "dropper", "sprayer", "closure", "cap", "airless", "lotion bottle",
     "cream jar", "serum bottle", "plastic bottle", "glass bottle",
     "cosmetic packaging", "packaging manufacturer", "packaging supplier",
+]
+
+JUNK_DESCRIPTION_PATTERNS = [
+    r"^\d+\s+company\s+images?$",
+    r"^company\s+images?$",
+    r"^matching\s+products?$",
+    r"^company\s+profile$",
+    r"^product\s+list$",
+    r"^contact\s+information$",
 ]
 
 CATEGORIES = [
@@ -133,6 +202,11 @@ class SupplierRecord:
     email: str = ""
     source_directory: str = SOURCE_DIRECTORY
     profile_url: str = ""
+    company_description: str = ""
+    is_target_supplier: bool = False
+    confidence: float = 0.0
+    ai_reason: str = ""
+    ai_target_keywords: str = ""
 
 
 def clean_email(email: str) -> Optional[str]:
@@ -286,6 +360,47 @@ def strip_tags(text: str) -> str:
     return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", text))).strip()
 
 
+def strip_divs_by_class(html: str, class_name: str) -> str:
+    """Remove div blocks with a class, including nested divs."""
+    output = html or ""
+    class_re = re.compile(
+        rf'<div\b[^>]*class=["\'][^"\']*\b{re.escape(class_name)}\b[^"\']*["\'][^>]*>',
+        re.I,
+    )
+    while True:
+        match = class_re.search(output)
+        if not match:
+            return output
+        pos = match.end()
+        depth = 1
+        tag_re = re.compile(r'</?div\b[^>]*>', re.I)
+        for tag in tag_re.finditer(output, pos):
+            if tag.group(0).lower().startswith("</div"):
+                depth -= 1
+            else:
+                depth += 1
+            if depth == 0:
+                output = output[:match.start()] + " " + output[tag.end():]
+                break
+        else:
+            output = output[:match.start()]
+
+
+def is_junk_description(text: str) -> bool:
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    if not clean:
+        return True
+    low = clean.lower()
+    if len(clean) < 30:
+        return True
+    return any(re.search(pattern, low, re.I) for pattern in JUNK_DESCRIPTION_PATTERNS)
+
+
+def clean_company_description(text: str) -> str:
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    return "" if is_junk_description(clean) else clean
+
+
 def build_url(category: str, country_code: str, page: int) -> str:
     if page <= 1:
         return f"{BASE_DOMAIN}/companies/{country_code}/{category}.html"
@@ -326,7 +441,7 @@ def parse_company_listings(html: str) -> list[dict]:
         desc = ""
         desc_match = re.search(r'<p[^>]*>(.*?)</p>', context, re.I | re.DOTALL)
         if desc_match:
-            desc = strip_tags(desc_match.group(1))
+            desc = clean_company_description(strip_tags(desc_match.group(1)))
         companies.append({"name": name, "profile_url": profile_url, "description": desc})
     return companies
 
@@ -361,12 +476,33 @@ def extract_website_from_profile(html: str) -> str:
     return ""
 
 
+def extract_company_description_from_profile(html: str) -> str:
+    """Extract EC21 company intro from div.txt_info.par_g."""
+    html = strip_divs_by_class(html, "thumb_box")
+    patterns = [
+        r'<div[^>]*class=["\'][^"\']*\btxt_info\b[^"\']*\bpar_g\b[^"\']*["\'][^>]*>(.*?)</div>',
+        r'<div[^>]*class=["\'][^"\']*\bpar_g\b[^"\']*\btxt_info\b[^"\']*["\'][^>]*>(.*?)</div>',
+    ]
+    candidates = []
+    for pattern in patterns:
+        for match in re.findall(pattern, html, re.I | re.DOTALL):
+            text = clean_company_description(strip_tags(match))
+            if text:
+                candidates.append(text)
+    if not candidates:
+        return ""
+    return max(candidates, key=len)
+
+
 def enrich_single_profile(args):
     norm_name, record = args
     local_fetcher = ScraplingStealthFetcher(browser_engine="camoufox")
     try:
         _, html = fetch_html(local_fetcher, record.profile_url)
         if html:
+            description = extract_company_description_from_profile(html)
+            if description and not record.company_description:
+                record.company_description = description
             website = extract_website_from_profile(html)
             if website and not record.website_url:
                 record.website_url = website
@@ -447,6 +583,7 @@ def main():
                         company_name=company["name"],
                         country=country_name,
                         profile_url=company["profile_url"],
+                        company_description=company.get("description", ""),
                     )
                     page_records.append((norm_name, record))
                 
@@ -474,6 +611,19 @@ def main():
     
     save_checkpoint(all_records, PARTIAL_SCRAPE_CSV)
     print(f"\n[PHASE 1 DONE] {len(all_records)} companies. Saved to {PARTIAL_SCRAPE_CSV}")
+
+    if all_records and ENABLE_AI_FILTERING:
+        all_records = apply_ai_filter_to_records(
+            all_records,
+            keywords=CATEGORIES,
+            source_name=SOURCE_DIRECTORY,
+            verified_csv=AI_VERIFIED_CSV,
+            rejected_csv=AI_REJECTED_CSV,
+            checkpoint_csv=AI_CHECKPOINT_CSV,
+            batch_size=AI_BATCH_SIZE,
+            concurrent=AI_CONCURRENT,
+        )
+        save_checkpoint(all_records, PARTIAL_ENRICH_CSV)
     
     # PHASE 2: EMAIL ENRICHMENT
     candidates = [r for r in all_records if r.website_url and not r.email]
