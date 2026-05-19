@@ -20,7 +20,8 @@ from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
-from ai_supplier_filter import apply_ai_filter_to_records
+# AI filtering is currently disabled so the scraper jumps straight to email enrichment.
+# from ai_supplier_filter import apply_ai_filter_to_records
 from scraper_runtime_config import env_int, env_list
 
 try:
@@ -42,7 +43,7 @@ OUTPUT_CSV = "europages_suppliers_phase1_raw.csv"
 CLEANED_CSV = "europages_suppliers_cleaned.csv"
 PARTIAL_SCRAPE_CSV = "europages_suppliers_scrape_progress.csv"
 PARTIAL_ENRICH_CSV = "europages_suppliers_enrich_progress.csv"
-TARGET_SUPPLIERS = 5000
+TARGET_SUPPLIERS = 2000
 AUTOSAVE_EVERY_NEW_RECORDS = 10
 AUTOSAVE_EVERY_NEW_EMAILS = 10
 
@@ -54,7 +55,7 @@ ENABLE_WEBSITE_EMAIL_ENRICHMENT = True
 MAX_WEBSITE_EMAIL_LOOKUPS = TARGET_SUPPLIERS
 WEBSITE_EMAIL_WORKERS = 10
 WEBSITE_TIMEOUT = 15
-ENABLE_AI_FILTERING = True
+ENABLE_AI_FILTERING = False
 AI_VERIFIED_CSV = "europages_ai_verified.csv"
 AI_REJECTED_CSV = "europages_ai_rejected.csv"
 AI_CHECKPOINT_CSV = "europages_ai_checkpoint.csv"
@@ -223,8 +224,15 @@ def is_junk_name(name: str) -> bool:
 def save_records(records: list[SupplierRecord], filepath: str):
     if records:
         df = pd.DataFrame([asdict(r) for r in records])
-        df.to_csv(filepath, index=False, encoding="utf-8-sig", sep='\t')
+        df.to_csv(filepath, index=False, encoding="utf-8-sig")
         print(f"  💾 Saved {len(records)} records to {filepath}")
+
+
+def filter_records_with_company_websites(records: list[SupplierRecord]) -> list[SupplierRecord]:
+    kept = [record for record in records if record.website_url and is_plausible_website(record.website_url)]
+    removed = len(records) - len(kept)
+    print(f"[CLEANUP] Keeping {len(kept)} records with company websites; removed {removed} before email enrichment.")
+    return kept
 
 
 def strip_tags(text: str) -> str:
@@ -972,7 +980,7 @@ def main():
     print(f"  Phase 3: Extract emails from websites")
     print(f"\n  📌 Solve CAPTCHA once in the browser window.\n")
     
-    input("Press ENTER to start...")
+    print("Starting browser automatically. If CAPTCHA appears, solve it in the opened browser within 5 minutes.")
     
     all_records = []
     seen_names = set()
@@ -1065,20 +1073,25 @@ def main():
         run_contact_page_enrichment(all_records)
     
     # ================================================================
-    # PHASE 3: AI filtering
+    # PHASE 3: Website-backed record filtering
     # ================================================================
-    if all_records and ENABLE_AI_FILTERING:
-        all_records = apply_ai_filter_to_records(
-            all_records,
-            keywords=KEYWORDS,
-            source_name=SOURCE_DIRECTORY,
-            verified_csv=AI_VERIFIED_CSV,
-            rejected_csv=AI_REJECTED_CSV,
-            checkpoint_csv=AI_CHECKPOINT_CSV,
-            batch_size=AI_BATCH_SIZE,
-            concurrent=AI_CONCURRENT,
-        )
+    if all_records:
+        all_records = filter_records_with_company_websites(all_records)
         save_records(all_records, PARTIAL_ENRICH_CSV)
+
+    # AI filtering disabled: go directly from website filtering to email enrichment.
+    # if all_records and ENABLE_AI_FILTERING:
+    #     all_records = apply_ai_filter_to_records(
+    #         all_records,
+    #         keywords=KEYWORDS,
+    #         source_name=SOURCE_DIRECTORY,
+    #         verified_csv=AI_VERIFIED_CSV,
+    #         rejected_csv=AI_REJECTED_CSV,
+    #         checkpoint_csv=AI_CHECKPOINT_CSV,
+    #         batch_size=AI_BATCH_SIZE,
+    #         concurrent=AI_CONCURRENT,
+    #     )
+    #     save_records(all_records, PARTIAL_ENRICH_CSV)
     
     # ================================================================
     # PHASE 4: Email enrichment from websites
@@ -1091,10 +1104,10 @@ def main():
     # ================================================================
     if all_records:
         df = pd.DataFrame([asdict(r) for r in all_records])
-        df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig", sep='\t')
+        df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
         
         df_clean = df[df['email'].notna() & (df['email'] != '')]
-        df_clean.to_csv(CLEANED_CSV, index=False, encoding="utf-8-sig", sep='\t')
+        df_clean.to_csv(CLEANED_CSV, index=False, encoding="utf-8-sig")
         
         with_website = (df['website_url'] != '').sum()
         with_email = (df['email'] != '').sum()

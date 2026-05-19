@@ -7,6 +7,7 @@ runs/
 __pycache__/
 server/__pycache__/
 *.pyc
+*.pyd
 
 # Lock files
 ~*.lock*
@@ -15,7 +16,8 @@ server/__pycache__/
 # OS files
 .DS_Store
 Thumbs.db
-.mic_contact_playwright_profile
-.tradewheel_search_profile
-.europages_playwright_profile
+.mic_contact_playwright_profile/
+.tradewheel_search_profile/
+.europages_playwright_profile/
+.tradewheel_country_probe_profile/
 runs/

@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from html import unescape
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -29,7 +30,7 @@ PARTIAL_ENRICH_CSV = "exportpages_suppliers_enrich_progress.csv"
 TARGET_SUPPLIERS = 500
 AUTOSAVE_EVERY_NEW_RECORDS = 10
 AUTOSAVE_EVERY_NEW_EMAILS = 10
-MAX_PAGES_PER_COUNTRY = 5
+MAX_PAGES_PER_COUNTRY = 10
 
 COUNTRIES = {
     "China": "44", "South Korea": "125", "Taiwan": "196", "Japan": "107",
@@ -164,18 +165,35 @@ def lookup_email(website_url: str) -> str:
     return ""
 
 
+def is_plausible_website(url: str) -> bool:
+    value = (url or "").strip()
+    if not value or value.lower() == "nan":
+        return False
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    return bool(parsed.netloc)
+
+
+def filter_results_with_company_websites(results: list[dict]) -> list[dict]:
+    kept = [r for r in results if is_plausible_website(r.get("website_url", ""))]
+    removed = len(results) - len(kept)
+    print(f"[CLEANUP] Keeping {len(kept)} records with company websites; removed {removed} before email enrichment.")
+    return kept
+
+
 def save_checkpoint(results, path):
     if not results:
         return
     df = pd.DataFrame(results)
     df["name_norm"] = df["company_name"].str.lower().str.strip()
     df = df.drop_duplicates(subset=["name_norm"]).drop(columns=["name_norm"])
-    df.to_csv(path, index=False, encoding="utf-8-sig", sep='\t')
+    df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
 def load_existing_data():
     if Path(OUTPUT_CSV).exists():
-        df = pd.read_csv(OUTPUT_CSV, sep='\t')
+        df = pd.read_csv(OUTPUT_CSV)
         print(f"[RESUME] Loaded {len(df)} existing suppliers")
         return df.to_dict('records'), set(df['company_name'].str.lower().str.strip())
     return [], set()
@@ -329,6 +347,9 @@ def main():
         browser.close()
     
     # Phase 2: Email enrichment with requests
+    all_results = filter_results_with_company_websites(all_results)
+    save_checkpoint(all_results, PARTIAL_ENRICH_CSV)
+
     candidates = [r for r in all_results if r.get('website_url') and not r.get('email')]
     print(f"\n[EMAILS] Enriching {len(candidates)} websites...")
     print(f"  Strategy: Footer → Homepage → {len(CONTACT_PATHS)} contact paths")
@@ -368,10 +389,10 @@ def main():
     df = pd.DataFrame(all_results)
     df["name_norm"] = df["company_name"].str.lower().str.strip()
     df = df.drop_duplicates(subset=["name_norm"]).drop(columns=["name_norm"])
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig", sep='\t')
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
     
     df_clean = df[df['email'].notna() & (df['email'] != '')]
-    df_clean.to_csv(CLEANED_CSV, index=False, encoding="utf-8-sig", sep='\t')
+    df_clean.to_csv(CLEANED_CSV, index=False, encoding="utf-8-sig")
     
     print(f"\n{'='*60}")
     print(f"DONE!")

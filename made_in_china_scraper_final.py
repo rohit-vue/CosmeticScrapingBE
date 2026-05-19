@@ -20,7 +20,8 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
-from ai_supplier_filter import apply_ai_filter_to_records
+# AI filtering is currently disabled so the scraper jumps straight to email enrichment.
+# from ai_supplier_filter import apply_ai_filter_to_records
 from scraper_runtime_config import env_int, env_list
 
 try:
@@ -36,7 +37,7 @@ except ImportError:
     PlaywrightTimeoutError = Exception
 
 
-# ===== KEYWORDS & COUNTRIES (STANDALONE) =====
+# ===== KEYWORDS =====
 KEYWORDS = [
     # TUBES
     "cosmetic tube",
@@ -85,33 +86,6 @@ KEYWORDS = [
     "cosmetic packaging OEM",
 ]
 
-COUNTRIES = [
-    "Russia",
-    "Ukraine",
-    "Poland",
-    "Czech Republic",
-    "Hungary",
-    "Romania",
-    "Bulgaria",
-    "Belarus",
-    "Serbia",
-    "Croatia",
-    "Slovakia",
-    "Slovenia",
-    "Lithuania",
-    "Latvia",
-    "Turkey",
-    "China",
-    "South Korea",
-    "Taiwan",
-    "Japan",
-    "Vietnam",
-    "Thailand",
-    "Singapore",
-    "Malaysia",
-    "Hong Kong",
-]
-
 # ===== CONFIGURATION =====
 DEFAULT_COUNTRY = "China"
 SOURCE_DIRECTORY = "Made-in-China"
@@ -124,7 +98,7 @@ OUTPUT_CSV = "made_in_china_suppliers_phase1_raw.csv"
 CLEANED_CSV = "made_in_china_suppliers_cleaned.csv"
 PARTIAL_SCRAPE_CSV = "made_in_china_suppliers_partial_scrape.csv"
 PARTIAL_ENRICH_CSV = "made_in_china_suppliers_partial_enrichment.csv"
-TARGET_SUPPLIERS = 5000
+TARGET_SUPPLIERS = 10000
 AUTOSAVE_EVERY_NEW_RECORDS = 10
 AUTOSAVE_EVERY_NEW_EMAILS = 1
 PROFILE_ENRICH_DURING_SCRAPE = False
@@ -134,7 +108,7 @@ ENABLE_WEBSITE_EMAIL_ENRICHMENT = True
 MAX_WEBSITE_EMAIL_LOOKUPS = 0
 WEBSITE_EMAIL_WORKERS = 10
 WEBSITE_TIMEOUT = 15
-ENABLE_AI_FILTERING = True
+ENABLE_AI_FILTERING = False
 AI_VERIFIED_CSV = "made_in_china_ai_verified.csv"
 AI_REJECTED_CSV = "made_in_china_ai_rejected.csv"
 AI_CHECKPOINT_CSV = "made_in_china_ai_checkpoint.csv"
@@ -168,7 +142,7 @@ CONTACT_PATHS = [
     "/en/contact-us",
 ]
 
-MIC_SITE_GAP_SECONDS = float(os.getenv("MIC_SITE_GAP_SECONDS", "3") or "3")
+MIC_SITE_GAP_SECONDS = float(os.getenv("MIC_SITE_GAP_SECONDS", "1.5") or "1.5")
 MIC_SITE_GAP_JITTER_SECONDS = float(os.getenv("MIC_SITE_GAP_JITTER_SECONDS", "0") or "0")
 
 CONTACT_ENRICHMENT_USE_PLAYWRIGHT = True
@@ -187,8 +161,6 @@ DEFAULT_HEADERS = {
 }
 
 KEYWORDS = env_list("SCRAPER_KEYWORDS", KEYWORDS)
-COUNTRIES = env_list("SCRAPER_COUNTRIES", COUNTRIES)
-DEFAULT_COUNTRY = COUNTRIES[0] if COUNTRIES else DEFAULT_COUNTRY
 TARGET_SUPPLIERS = env_int("SCRAPER_TARGET_SUPPLIERS", TARGET_SUPPLIERS)
 MAX_CONTACT_ENRICHMENTS = env_int("MADE_IN_CHINA_MAX_CONTACT_ENRICHMENTS", MAX_CONTACT_ENRICHMENTS)
 MAX_WEBSITE_EMAIL_LOOKUPS = env_int("MADE_IN_CHINA_MAX_EMAIL_LOOKUPS", MAX_WEBSITE_EMAIL_LOOKUPS)
@@ -428,6 +400,7 @@ def to_deduped_dataframe(records: list[SupplierRecord]) -> pd.DataFrame:
     df = pd.DataFrame([asdict(r) for r in records])
     if df.empty:
         return df
+    df["country"] = DEFAULT_COUNTRY
     df["company_name_norm"] = (
         df["company_name"].fillna("").astype(str).str.strip().str.lower().str.replace(r"\s+", " ", regex=True)
     )
@@ -437,13 +410,20 @@ def to_deduped_dataframe(records: list[SupplierRecord]) -> pd.DataFrame:
 def save_scrape_checkpoint(records: list[SupplierRecord], output_path: str) -> None:
     df = to_deduped_dataframe(records)
     if not df.empty:
-        df.to_csv(output_path, index=False, encoding="utf-8-sig", sep='\t')
+        df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
 
 def save_enrich_checkpoint(records: list[SupplierRecord], output_path: str) -> None:
     df = to_deduped_dataframe(records)
     if not df.empty:
-        df.to_csv(output_path, index=False, encoding="utf-8-sig", sep='\t')
+        df.to_csv(output_path, index=False, encoding="utf-8-sig")
+
+
+def filter_records_with_company_websites(records: list[SupplierRecord]) -> list[SupplierRecord]:
+    kept = [record for record in records if record.website_url and is_plausible_external_website(record.website_url)]
+    removed = len(records) - len(kept)
+    print(f"[CLEANUP] Keeping {len(kept)} records with company websites; removed {removed} before email enrichment.")
+    return kept
 
 
 def parse_company_anchors(html: str) -> list[dict[str, str]]:
@@ -971,22 +951,27 @@ def scrape_made_in_china() -> pd.DataFrame:
         save_scrape_checkpoint(all_records, PARTIAL_SCRAPE_CSV)
         print(f"[PHASE 2 DONE] Contact-page enrichment complete.")
 
-    if all_records and ENABLE_AI_FILTERING:
-        print("\n[PHASE 3] Starting AI filtering...")
-        all_records = apply_ai_filter_to_records(
-            all_records,
-            keywords=KEYWORDS,
-            source_name=SOURCE_DIRECTORY,
-            verified_csv=AI_VERIFIED_CSV,
-            rejected_csv=AI_REJECTED_CSV,
-            checkpoint_csv=AI_CHECKPOINT_CSV,
-            batch_size=AI_BATCH_SIZE,
-            concurrent=AI_CONCURRENT,
-        )
+    if all_records:
+        all_records = filter_records_with_company_websites(all_records)
         save_enrich_checkpoint(all_records, PARTIAL_ENRICH_CSV)
 
+    # AI filtering disabled: go directly from website filtering to email enrichment.
+    # if all_records and ENABLE_AI_FILTERING:
+    #     print("\n[PHASE 3] Starting AI filtering...")
+    #     all_records = apply_ai_filter_to_records(
+    #         all_records,
+    #         keywords=KEYWORDS,
+    #         source_name=SOURCE_DIRECTORY,
+    #         verified_csv=AI_VERIFIED_CSV,
+    #         rejected_csv=AI_REJECTED_CSV,
+    #         checkpoint_csv=AI_CHECKPOINT_CSV,
+    #         batch_size=AI_BATCH_SIZE,
+    #         concurrent=AI_CONCURRENT,
+    #     )
+    #     save_enrich_checkpoint(all_records, PARTIAL_ENRICH_CSV)
+
     if all_records and ENABLE_WEBSITE_EMAIL_ENRICHMENT:
-        print("\n[PHASE 4] Starting email enrichment for AI-verified companies...")
+        print("\n[PHASE 4] Starting email enrichment for companies with websites...")
         enrich_emails_from_company_websites(all_records)
         save_enrich_checkpoint(all_records, PARTIAL_ENRICH_CSV)
 
@@ -998,10 +983,10 @@ def main() -> None:
     if df.empty:
         print("[INFO] No records found.")
         return
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig", sep='\t')
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
 
     df_clean = df[df['email'].notna() & (df['email'] != '')]
-    df_clean.to_csv(CLEANED_CSV, index=False, encoding="utf-8-sig", sep='\t')
+    df_clean.to_csv(CLEANED_CSV, index=False, encoding="utf-8-sig")
 
     print(f"\n{'='*60}")
     print(f"ALL DONE!")

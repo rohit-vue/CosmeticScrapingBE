@@ -83,7 +83,7 @@ class RunManager:
         }
         self.active_run: RunRecord | None = None
         self._active_procs: dict[str, subprocess.Popen[str]] = {}
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = ThreadPoolExecutor(max_workers=max(1, len(SCRAPERS)))
 
     def list_scrapers(self) -> list[ScraperState]:
         with self._lock:
@@ -107,11 +107,41 @@ class RunManager:
         run_countries = self._clean_list(countries)
         run_target = target_suppliers if target_suppliers and target_suppliers > 0 else None
         with self._lock:
-            if self.active_run and self.active_run.status == "running":
-                raise RuntimeError("A run is already in progress.")
             ids = [sid for sid in scraper_ids if sid in SCRAPERS]
             if not ids:
                 raise RuntimeError("No valid scraper ids provided.")
+            if self.active_run and self.active_run.status == "running":
+                run_id = self.active_run.run_id
+                active_ids = set(self.active_run.scraper_ids)
+                ids = [
+                    sid for sid in ids
+                    if sid not in active_ids and self.states[sid].status not in {"queued", "running"}
+                ]
+                if not ids:
+                    return run_id
+                self.active_run.scraper_ids.extend(ids)
+                if run_keywords:
+                    self.active_run.keywords = run_keywords
+                if run_countries:
+                    self.active_run.countries = run_countries
+                if run_target:
+                    self.active_run.target_suppliers = run_target
+                for sid in ids:
+                    if run_keywords:
+                        self.states[sid].keywords = list(run_keywords)
+                    if run_countries:
+                        self.states[sid].countries = list(run_countries)
+                    self.states[sid].status = "queued"
+                    self.states[sid].progress = 0
+                self._executor.submit(
+                    self._execute_run,
+                    run_id,
+                    ids,
+                    run_keywords,
+                    run_countries,
+                    run_target,
+                )
+                return run_id
             run_id = str(uuid4())
             self.active_run = RunRecord(
                 run_id=run_id,
@@ -331,17 +361,42 @@ class RunManager:
                 if summary.outcome == "stopped":
                     stopped += 1
 
-        combined = merge_cleaned_outputs(run_id=run_id, run_path=output_dir, scraper_ids=scraper_ids)
+        with self._lock:
+            active_ids = (
+                list(self.active_run.scraper_ids)
+                if self.active_run and self.active_run.run_id == run_id
+                else list(scraper_ids)
+            )
+
+        combined = merge_cleaned_outputs(run_id=run_id, run_path=output_dir, scraper_ids=active_ids)
         with self._lock:
             if self.active_run and self.active_run.run_id == run_id:
+                self.active_run.combined_csv = combined
+                active_ids = list(self.active_run.scraper_ids)
+                still_active = any(
+                    self.states[sid].status in {"queued", "running"}
+                    for sid in active_ids
+                    if sid in self.states
+                )
+                if still_active:
+                    return
+                failures = sum(
+                    1
+                    for sid in active_ids
+                    if sid in self.states and self.states[sid].last_run and self.states[sid].last_run.outcome == "failed"
+                )
+                stopped = sum(
+                    1
+                    for sid in active_ids
+                    if sid in self.states and self.states[sid].last_run and self.states[sid].last_run.outcome == "stopped"
+                )
                 self.active_run.ended_at = utc_now_iso()
                 if failures:
                     self.active_run.status = "failed"
-                elif stopped and stopped == len(scraper_ids):
+                elif stopped and stopped == len(active_ids):
                     self.active_run.status = "stopped"
                 else:
                     self.active_run.status = "succeeded"
-                self.active_run.combined_csv = combined
                 write_run_meta(
                     run_id,
                     {
@@ -349,10 +404,10 @@ class RunManager:
                         "status": self.active_run.status,
                         "started_at": self.active_run.started_at,
                         "ended_at": self.active_run.ended_at,
-                        "scraper_ids": scraper_ids,
-                        "keywords": keywords,
-                        "countries": countries,
-                        "target_suppliers": target_suppliers,
+                        "scraper_ids": active_ids,
+                        "keywords": self.active_run.keywords,
+                        "countries": self.active_run.countries,
+                        "target_suppliers": self.active_run.target_suppliers,
                         "combined_csv": str(combined),
                     },
                 )

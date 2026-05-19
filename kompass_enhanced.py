@@ -31,7 +31,9 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 import pandas as pd
 import requests
-from ai_supplier_filter import AI_RESULT_FIELDS, apply_ai_filter_to_records
+# AI filtering is currently disabled so enrichment runs on all rows.
+# from ai_supplier_filter import AI_RESULT_FIELDS, apply_ai_filter_to_records
+AI_RESULT_FIELDS: list[str] = []
 from proxy_service import (
     ProxyEndpoint,
     ProxyExhaustedError,
@@ -168,7 +170,7 @@ AUTOSAVE_EVERY_NEW_RECORDS = 10
 AUTOSAVE_EVERY_NEW_EMAILS = int(os.getenv("KOMPASS_AUTOSAVE_EVERY_NEW_EMAILS", "1"))
 ENABLE_PROFILE_WEBSITE_ENRICHMENT = True
 MAX_PROFILE_WEBSITE_LOOKUPS = 0
-ENABLE_AI_FILTERING = True
+ENABLE_AI_FILTERING = False
 AI_OUTPUT_CSV = "kompass_cosmetic_bottles_verified.csv"
 AI_REJECTED_CSV = "kompass_cosmetic_bottles_rejected.csv"
 AI_CHECKPOINT_CSV = "kompass_ai_checkpoint.csv"
@@ -572,6 +574,16 @@ def is_plausible_external_website(url: str) -> bool:
 
 def is_blocked_platform_website_url(url: str) -> bool:
     return not is_plausible_external_website((url or "").strip())
+
+
+def filter_rows_with_company_websites(rows: list[dict]) -> list[dict]:
+    kept = [
+        row for row in rows
+        if is_plausible_external_website((row.get("website_url") or "").strip())
+    ]
+    removed = len(rows) - len(kept)
+    print(f"[CLEANUP] Keeping {len(kept)} rows with company websites; removed {removed} before email enrichment.")
+    return kept
 
 
 def clean_email(email: str) -> str:
@@ -1784,30 +1796,33 @@ def run_enrichment(
         else:
             print("[PHASE 2A] Profile enrichment disabled.")
 
-        if skip_ai or not ENABLE_AI_FILTERING:
-            print("\n[PHASE 2B] AI filtering skipped; email enrichment will use all profile-enriched rows.")
-            verified_rows = rows
-            email_store = store
-        else:
-            print("\n[PHASE 2B] Starting AI verification against target keywords...")
-            verified_rows = apply_ai_filter_to_records(
-                rows,
-                keywords=KEYWORDS,
-                source_name=SOURCE_DIRECTORY,
-                verified_csv=ai_output_path,
-                rejected_csv=ai_rejected_path,
-                checkpoint_csv=ai_checkpoint_path,
-                min_confidence=ai_min_confidence,
-                batch_size=ai_batch_size,
-                concurrent=ai_concurrent,
-                model=ai_model,
-                api_key=api_key,
-            )
-            email_store = CsvStore(ai_output_path, AI_FIELDNAMES)
-            print("[PHASE 2B] AI verification complete.")
+        print("\n[PHASE 2B] AI filtering disabled; dropping rows without websites before email enrichment.")
+        verified_rows = filter_rows_with_company_websites(rows)
+        rows = verified_rows
+        email_store = store
+        email_store.write_all(verified_rows)
+
+        # AI filtering disabled: go directly from profile enrichment to email enrichment.
+        # if not skip_ai and ENABLE_AI_FILTERING:
+        #     print("\n[PHASE 2B] Starting AI verification against target keywords...")
+        #     verified_rows = apply_ai_filter_to_records(
+        #         rows,
+        #         keywords=KEYWORDS,
+        #         source_name=SOURCE_DIRECTORY,
+        #         verified_csv=ai_output_path,
+        #         rejected_csv=ai_rejected_path,
+        #         checkpoint_csv=ai_checkpoint_path,
+        #         min_confidence=ai_min_confidence,
+        #         batch_size=ai_batch_size,
+        #         concurrent=ai_concurrent,
+        #         model=ai_model,
+        #         api_key=api_key,
+        #     )
+        #     email_store = CsvStore(ai_output_path, AI_FIELDNAMES)
+        #     print("[PHASE 2B] AI verification complete.")
 
         if ENABLE_WEBSITE_EMAIL_ENRICHMENT:
-            print("\n[PHASE 2C] Starting website-email enrichment for AI-verified companies...")
+            print("\n[PHASE 2C] Starting website-email enrichment for companies with websites...")
             verified_rows = enrich_email_from_website_rows(
                 verified_rows, email_store, MAX_WEBSITE_EMAIL_LOOKUPS, max_workers=WEBSITE_EMAIL_WORKERS
             )
@@ -1842,7 +1857,7 @@ def main() -> None:
     parser.add_argument("--skip-enrichment", action="store_true",
                         help="Skip Phase 2 enrichment; only scrape")
     parser.add_argument("--skip-ai", action="store_true",
-                        help="Skip AI filtering and run email enrichment on all enriched rows")
+                        help="Unused while AI filtering is disabled")
     parser.add_argument("--input", default=OUTPUT_CSV,
                         help="Input CSV for enrichment (when skipping scrape)")
     parser.add_argument("--output", default=CLEANED_CSV,
@@ -1852,21 +1867,21 @@ def main() -> None:
     parser.add_argument("--checkpoint", default=CHECKPOINT_CSV,
                         help="Enrichment checkpoint CSV path")
     parser.add_argument("--ai-output", default=AI_OUTPUT_CSV,
-                        help="AI-verified suppliers CSV; email enrichment writes back to this file")
+                        help="Unused while AI filtering is disabled")
     parser.add_argument("--ai-rejected", default=AI_REJECTED_CSV,
-                        help="AI-rejected suppliers CSV")
+                        help="Unused while AI filtering is disabled")
     parser.add_argument("--ai-checkpoint", default=AI_CHECKPOINT_CSV,
-                        help="AI filtering checkpoint CSV")
+                        help="Unused while AI filtering is disabled")
     parser.add_argument("--api-key", default="",
                         help="OpenAI API key override; otherwise uses OPENAI_API_KEY from .env")
     parser.add_argument("--ai-model", default=OPENAI_MODEL,
-                        help="OpenAI model for AI filtering")
+                        help="Unused while AI filtering is disabled")
     parser.add_argument("--ai-min-confidence", type=float, default=AI_MIN_CONFIDENCE,
-                        help="Minimum AI confidence for verified suppliers")
+                        help="Unused while AI filtering is disabled")
     parser.add_argument("--ai-batch-size", type=int, default=AI_BATCH_SIZE,
-                        help="Companies per AI request")
+                        help="Unused while AI filtering is disabled")
     parser.add_argument("--ai-concurrent", type=int, default=AI_CONCURRENT,
-                        help="Concurrent AI batches")
+                        help="Unused while AI filtering is disabled")
     parser.add_argument("--workers", type=int, default=WEBSITE_EMAIL_WORKERS,
                         help="Threads for email step")
     parser.add_argument("--max-profile-lookups", type=int, default=MAX_PROFILE_WEBSITE_LOOKUPS,
@@ -1887,10 +1902,10 @@ def main() -> None:
     print("  Kompass Supplier Scraper + Enhanced Enrichment")
     print(f"  Proxy    : {'ON' if KOMPASS_USE_PROXY else 'OFF'}")
     print(f"  Profile  : {'Playwright' if USE_PLAYWRIGHT_PROFILE else 'HTTP only'}")
-    print(f"  AI       : {'OFF' if args.skip_ai else args.ai_model}")
+    print("  AI       : OFF")
     print(f"  Email    : requests-based (footer-first, {WEBSITE_TIMEOUT}s timeout)")
     print(f"  Workers  : {WEBSITE_EMAIL_WORKERS}")
-    print(f"  Output fields: website, description, classification, AI verdict, email")
+    print(f"  Output fields: website, description, classification, email")
     print("=" * 60)
 
     all_rows: list[dict] = []
