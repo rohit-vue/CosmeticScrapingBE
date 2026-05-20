@@ -167,17 +167,20 @@ class RunManager:
                     and sid not in active_procs_alive
                     and self.states[sid].status in {"succeeded", "failed", "stopped"}
                 ]
-                if restartable_ids and not active_procs_alive:
+                if restartable_ids:
                     ids = restartable_ids
-                    run_id = str(uuid4())
-                    self.active_run = RunRecord(
-                        run_id=run_id,
-                        scraper_ids=ids,
-                        started_at=utc_now_iso(),
-                        keywords=run_keywords,
-                        countries=run_countries,
-                        target_suppliers=run_target,
-                    )
+                    if active_procs_alive:
+                        run_id = self.active_run.run_id
+                    else:
+                        run_id = str(uuid4())
+                        self.active_run = RunRecord(
+                            run_id=run_id,
+                            scraper_ids=ids,
+                            started_at=utc_now_iso(),
+                            keywords=run_keywords,
+                            countries=run_countries,
+                            target_suppliers=run_target,
+                        )
                     for sid in ids:
                         self.states[sid].manual_keywords = list(run_keywords) if run_keywords else None
                         self.states[sid].manual_countries = list(run_countries) if run_countries else None
