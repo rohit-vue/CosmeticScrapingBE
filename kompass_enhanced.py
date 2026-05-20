@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from html import unescape
+from pathlib import Path
 from threading import Lock
 from typing import Any, Generator, Optional
 from urllib.parse import quote_plus, urlparse
@@ -221,6 +222,8 @@ USE_PLAYWRIGHT_PROFILE = os.getenv("KOMPASS_P2_PROFILE_BROWSER", "1").strip().lo
 }
 PLAYWRIGHT_PROFILE_TIMEOUT_MS = int(os.getenv("KOMPASS_P2_PROFILE_TIMEOUT_MS", "90000") or "90000")
 PLAYWRIGHT_ARGS = ["--disable-blink-features=AutomationControlled"]
+KOMPASS_BROWSER_PROFILE_DIR = ".kompass_playwright_profile"
+KOMPASS_PROFILE_BROWSER_PROFILE_DIR = ".kompass_profile_playwright_profile"
 COUNTRY_CODES = {
     "China": "CN",
     "South Korea": "KR",
@@ -418,7 +421,11 @@ class KompassBrowserHolder:
             except Exception:
                 pass
         launch_kwargs: dict = {
+            "user_data_dir": str(Path(KOMPASS_BROWSER_PROFILE_DIR).resolve()),
             "headless": PLAYWRIGHT_HEADLESS,
+            "viewport": {"width": 1366, "height": 768},
+            "locale": "en-US",
+            "user_agent": DEFAULT_HEADERS["User-Agent"],
             "args": PLAYWRIGHT_ARGS,
         }
         if PLAYWRIGHT_CHANNEL:
@@ -434,18 +441,13 @@ class KompassBrowserHolder:
             if cfg:
                 launch_kwargs["proxy"] = cfg
         try:
-            self.browser = self.playwright.chromium.launch(**launch_kwargs)
+            self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
         except Exception as exc:
             if launch_kwargs.pop("channel", None):
                 print(f"[BROWSER][WARN] Could not launch channel '{PLAYWRIGHT_CHANNEL}': {exc}")
-                self.browser = self.playwright.chromium.launch(**launch_kwargs)
+                self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
             else:
                 raise
-        self.context = self.browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            user_agent=DEFAULT_HEADERS["User-Agent"],
-        )
         browser_name = PLAYWRIGHT_CHANNEL if PLAYWRIGHT_CHANNEL else "chromium"
         print(f"[BROWSER][KOMPASS] relaunch browser={browser_name}")
         self.page = self.context.new_page()
@@ -818,10 +820,14 @@ def profile_playwright_page() -> Generator[Any, None, None]:
             "playwright is not installed. Run: pip install playwright && playwright install chrome"
         )
     pw = sync_playwright().start()
-    browser = None
+    context = None
     try:
         launch_kwargs: dict[str, Any] = {
+            "user_data_dir": str(Path(KOMPASS_PROFILE_BROWSER_PROFILE_DIR).resolve()),
             "headless": PLAYWRIGHT_HEADLESS,
+            "viewport": {"width": 1366, "height": 768},
+            "locale": "en-US",
+            "user_agent": DEFAULT_HEADERS["User-Agent"],
             "args": PLAYWRIGHT_ARGS,
         }
         if PLAYWRIGHT_CHANNEL:
@@ -831,24 +837,19 @@ def profile_playwright_page() -> Generator[Any, None, None]:
         elif PROXY_POOL:
             pass
         try:
-            browser = pw.chromium.launch(**launch_kwargs)
+            context = pw.chromium.launch_persistent_context(**launch_kwargs)
         except Exception as exc:
             if launch_kwargs.pop("channel", None):
                 print(f"[PROFILE][WARN] Could not launch channel '{PLAYWRIGHT_CHANNEL}': {exc}")
-                browser = pw.chromium.launch(**launch_kwargs)
+                context = pw.chromium.launch_persistent_context(**launch_kwargs)
             else:
                 raise
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            user_agent=DEFAULT_HEADERS["User-Agent"],
-        )
         page = context.new_page()
         yield page
     finally:
         try:
-            if browser:
-                browser.close()
+            if context:
+                context.close()
         except Exception:
             pass
         try:
@@ -1393,7 +1394,11 @@ def scrape_kompass() -> tuple[pd.DataFrame, list[SupplierRecord]]:
             holder.playwright = sync_playwright().start()
             holder.endpoint = PROXY_POOL.get() if PROXY_POOL else None
             launch_kwargs: dict = {
+                "user_data_dir": str(Path(KOMPASS_BROWSER_PROFILE_DIR).resolve()),
                 "headless": PLAYWRIGHT_HEADLESS,
+                "viewport": {"width": 1366, "height": 768},
+                "locale": "en-US",
+                "user_agent": DEFAULT_HEADERS["User-Agent"],
                 "args": PLAYWRIGHT_ARGS,
             }
             if PLAYWRIGHT_CHANNEL:
@@ -1409,20 +1414,15 @@ def scrape_kompass() -> tuple[pd.DataFrame, list[SupplierRecord]]:
                 if cfg:
                     launch_kwargs["proxy"] = cfg
             try:
-                holder.browser = holder.playwright.chromium.launch(**launch_kwargs)
+                holder.context = holder.playwright.chromium.launch_persistent_context(**launch_kwargs)
             except Exception as exc:
                 if launch_kwargs.pop("channel", None):
                     print(f"[BROWSER][WARN] Could not launch channel '{PLAYWRIGHT_CHANNEL}': {exc}")
-                    holder.browser = holder.playwright.chromium.launch(**launch_kwargs)
+                    holder.context = holder.playwright.chromium.launch_persistent_context(**launch_kwargs)
                 else:
                     raise
             browser_name = PLAYWRIGHT_CHANNEL if PLAYWRIGHT_CHANNEL else "chromium"
             print(f"[BROWSER][KOMPASS] initial browser={browser_name}")
-            holder.context = holder.browser.new_context(
-                viewport={"width": 1366, "height": 768},
-                locale="en-US",
-                user_agent=DEFAULT_HEADERS["User-Agent"],
-            )
             holder.page = holder.context.new_page()
             browser_page = holder.page
             try:

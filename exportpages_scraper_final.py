@@ -31,6 +31,8 @@ TARGET_SUPPLIERS = 500
 AUTOSAVE_EVERY_NEW_RECORDS = 10
 AUTOSAVE_EVERY_NEW_EMAILS = 10
 MAX_PAGES_PER_COUNTRY = 10
+EXPORTPAGES_PROFILE_DIR = ".exportpages_playwright_profile"
+PLAYWRIGHT_CHANNEL = "chrome"
 
 COUNTRIES = {
     "China": "44", "South Korea": "125", "Taiwan": "196", "Japan": "107",
@@ -286,11 +288,22 @@ def main():
     save_counter = 0
     
     with sync_playwright() as p:
-        browser = p.chromium.launch(
+        launch_kwargs = dict(
+            user_data_dir=str(Path(EXPORTPAGES_PROFILE_DIR).resolve()),
             headless=False,
-            args=["--disable-blink-features=AutomationControlled"]
+            viewport={"width": 1920, "height": 1080},
+            args=["--disable-blink-features=AutomationControlled"],
         )
-        context = browser.new_context(viewport={"width": 1920, "height": 1080})
+        if PLAYWRIGHT_CHANNEL:
+            launch_kwargs["channel"] = PLAYWRIGHT_CHANNEL
+        try:
+            context = p.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as exc:
+            if launch_kwargs.pop("channel", None):
+                print(f"[BROWSER][WARN] Could not launch channel '{PLAYWRIGHT_CHANNEL}': {exc}")
+                context = p.chromium.launch_persistent_context(**launch_kwargs)
+            else:
+                raise
         page = context.new_page()
         
         try:
@@ -344,7 +357,7 @@ def main():
             print("\n[INTERRUPTED] Saving...")
             save_checkpoint(all_results, PARTIAL_SCRAPE_CSV)
         
-        browser.close()
+        context.close()
     
     # Phase 2: Email enrichment with requests
     all_results = filter_results_with_company_websites(all_results)

@@ -148,7 +148,7 @@ MIC_SITE_GAP_JITTER_SECONDS = float(os.getenv("MIC_SITE_GAP_JITTER_SECONDS", "0"
 CONTACT_ENRICHMENT_USE_PLAYWRIGHT = True
 MIC_CONTACT_PROFILE_DIR = ".mic_contact_playwright_profile"
 CONTACT_ENRICHMENT_BROWSER_TIMEOUT_MS = 90000
-PLAYWRIGHT_CONTACT_CHANNEL = (os.getenv("MIC_PLAYWRIGHT_CHANNEL") or "").strip()
+PLAYWRIGHT_CONTACT_CHANNEL = (os.getenv("MIC_PLAYWRIGHT_CHANNEL") or "chrome").strip()
 PLAYWRIGHT_CONTACT_EXTRA_ARGS = ["--disable-blink-features=AutomationControlled"]
 
 DEFAULT_HEADERS = {
@@ -181,10 +181,11 @@ class SupplierRecord:
     source_directory: str = SOURCE_DIRECTORY
     profile_url: str = ""
     company_description: str = ""
-    is_target_supplier: bool = False
-    confidence: float = 0.0
-    ai_reason: str = ""
-    ai_target_keywords: str = ""
+    # AI filtering is disabled; keep output CSVs free of AI result columns.
+    # is_target_supplier: bool = False
+    # confidence: float = 0.0
+    # ai_reason: str = ""
+    # ai_target_keywords: str = ""
 
 
 def random_delay() -> None:

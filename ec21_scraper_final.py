@@ -204,10 +204,11 @@ class SupplierRecord:
     source_directory: str = SOURCE_DIRECTORY
     profile_url: str = ""
     company_description: str = ""
-    is_target_supplier: bool = False
-    confidence: float = 0.0
-    ai_reason: str = ""
-    ai_target_keywords: str = ""
+    # AI filtering is disabled; keep output CSVs free of AI result columns.
+    # is_target_supplier: bool = False
+    # confidence: float = 0.0
+    # ai_reason: str = ""
+    # ai_target_keywords: str = ""
 
 
 def clean_email(email: str) -> Optional[str]:

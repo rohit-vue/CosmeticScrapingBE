@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import signal
 import subprocess
 import sys
 import threading
@@ -44,6 +45,8 @@ _LEVEL_HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 _MAX_LOG_LINE_LEN = 800
 
+_STOP_KILL_DELAY_SECONDS = 8.0
+
 
 def _classify_level(message: str) -> str:
     for pat, lvl in _LEVEL_HINTS:
@@ -83,7 +86,48 @@ class RunManager:
         }
         self.active_run: RunRecord | None = None
         self._active_procs: dict[str, subprocess.Popen[str]] = {}
+        self._stop_requested: set[str] = set()
         self._executor = ThreadPoolExecutor(max_workers=max(1, len(SCRAPERS)))
+
+    def _terminate_process_tree(self, run_id: str, scraper_id: str, proc: subprocess.Popen[str]) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                proc.terminate()
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+        def kill_if_alive() -> None:
+            try:
+                proc.wait(timeout=_STOP_KILL_DELAY_SECONDS)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+
+            if proc.poll() is not None:
+                return
+
+            self.logs.emit(run_id, scraper_id, "warn", "Stop timed out; killing scraper process tree")
+            try:
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                else:
+                    proc.kill()
+            except Exception as exc:
+                self.logs.emit(run_id, scraper_id, "error", f"Failed to kill scraper process tree: {exc}")
+
+        threading.Thread(target=kill_if_alive, daemon=True).start()
 
     def list_scrapers(self) -> list[ScraperState]:
         with self._lock:
@@ -111,6 +155,47 @@ class RunManager:
             if not ids:
                 raise RuntimeError("No valid scraper ids provided.")
             if self.active_run and self.active_run.status == "running":
+                active_procs_alive = {
+                    sid
+                    for sid, proc in self._active_procs.items()
+                    if proc.poll() is None
+                }
+                restartable_ids = [
+                    sid
+                    for sid in ids
+                    if sid in self.active_run.scraper_ids
+                    and sid not in active_procs_alive
+                    and self.states[sid].status in {"succeeded", "failed", "stopped"}
+                ]
+                if restartable_ids:
+                    ids = restartable_ids
+                    run_id = str(uuid4())
+                    self.active_run = RunRecord(
+                        run_id=run_id,
+                        scraper_ids=ids,
+                        started_at=utc_now_iso(),
+                        keywords=run_keywords,
+                        countries=run_countries,
+                        target_suppliers=run_target,
+                    )
+                    for sid in ids:
+                        self.states[sid].manual_keywords = list(run_keywords) if run_keywords else None
+                        self.states[sid].manual_countries = list(run_countries) if run_countries else None
+                        if run_keywords:
+                            self.states[sid].keywords = list(run_keywords)
+                        if run_countries:
+                            self.states[sid].countries = list(run_countries)
+                        self.states[sid].status = "queued"
+                        self.states[sid].progress = 0
+                    self._executor.submit(
+                        self._execute_run,
+                        run_id,
+                        ids,
+                        run_keywords,
+                        run_countries,
+                        run_target,
+                    )
+                    return run_id
                 run_id = self.active_run.run_id
                 active_ids = set(self.active_run.scraper_ids)
                 ids = [
@@ -127,6 +212,8 @@ class RunManager:
                 if run_target:
                     self.active_run.target_suppliers = run_target
                 for sid in ids:
+                    self.states[sid].manual_keywords = list(run_keywords) if run_keywords else None
+                    self.states[sid].manual_countries = list(run_countries) if run_countries else None
                     if run_keywords:
                         self.states[sid].keywords = list(run_keywords)
                     if run_countries:
@@ -152,6 +239,8 @@ class RunManager:
                 target_suppliers=run_target,
             )
             for sid in ids:
+                self.states[sid].manual_keywords = list(run_keywords) if run_keywords else None
+                self.states[sid].manual_countries = list(run_countries) if run_countries else None
                 if run_keywords:
                     self.states[sid].keywords = list(run_keywords)
                 if run_countries:
@@ -176,9 +265,14 @@ class RunManager:
             for sid in target_ids:
                 proc = self._active_procs.get(sid)
                 if proc and proc.poll() is None:
-                    proc.terminate()
-                    self.states[sid].status = "stopped"
+                    self._stop_requested.add(sid)
+                    self._terminate_process_tree(run_id, sid, proc)
                     self.logs.emit(run_id, sid, "warn", "Stop requested by user")
+                elif sid in self.states and self.states[sid].status == "queued":
+                    self._stop_requested.add(sid)
+                    self.states[sid].status = "stopped"
+                    self.states[sid].progress = 0
+                    self.logs.emit(run_id, sid, "warn", "Queued scraper stopped by user")
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
@@ -212,6 +306,23 @@ class RunManager:
             started = utc_now_iso()
             t0 = monotonic()
             with self._lock:
+                if self.states[scraper_id].status == "stopped":
+                    elapsed = int((monotonic() - t0) * 1000)
+                    summary = RunSummary(
+                        id=run_id,
+                        started_at=started,
+                        ended_at=utc_now_iso(),
+                        duration_ms=elapsed,
+                        records_found=0,
+                        outcome="stopped",
+                    )
+                    state = self.states[scraper_id]
+                    state.progress = 0
+                    state.last_run = summary
+                    state.recent_runs = [summary, *state.recent_runs][:8]
+                    self._stop_requested.discard(scraper_id)
+                    self.logs.emit(run_id, scraper_id, "warn", f"{scraper.name} stopped before launch")
+                    return scraper_id, summary
                 self.states[scraper_id].status = "running"
                 self.states[scraper_id].progress = 5
 
@@ -244,6 +355,7 @@ class RunManager:
                 encoding="utf-8",
                 errors="replace",
                 env=child_env,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
             with self._lock:
                 self._active_procs[scraper_id] = proc
@@ -321,6 +433,16 @@ class RunManager:
                         f"Cleaned CSV written from partial data: {cleaned_path.name} ({cleaned_count or 0} rows)",
                     )
                 self.logs.emit(run_id, scraper_id, "warn", f"{scraper.name} stopped")
+            elif scraper_id in self._stop_requested:
+                summary.outcome = "stopped"
+                if cleaned_path is not None:
+                    self.logs.emit(
+                        run_id,
+                        scraper_id,
+                        "info",
+                        f"Cleaned CSV written from partial data: {cleaned_path.name} ({cleaned_count or 0} rows)",
+                    )
+                self.logs.emit(run_id, scraper_id, "warn", f"{scraper.name} stopped")
             else:
                 summary.outcome = "failed"
                 summary.error_message = f"Exit code {code}"
@@ -348,6 +470,7 @@ class RunManager:
                 else:
                     state.status = "failed"
                     state.progress = 0
+                self._stop_requested.discard(scraper_id)
                 state.last_run = summary
                 state.recent_runs = [summary, *state.recent_runs][:8]
             return scraper_id, summary
@@ -429,6 +552,8 @@ class RunManager:
             output_csv=s.output_csv,
             keywords=list(s.keywords),
             countries=list(s.countries),
+            manual_keywords=list(s.manual_keywords) if s.manual_keywords else None,
+            manual_countries=list(s.manual_countries) if s.manual_countries else None,
             status=s.status,
             progress=s.progress,
             last_run=s.last_run,
@@ -458,6 +583,8 @@ class RunManager:
             "cleanedCsv": cleaned_csv,
             "keywords": s.keywords,
             "countries": s.countries,
+            "manualKeywords": s.manual_keywords,
+            "manualCountries": s.manual_countries,
             "status": s.status,
             "progress": s.progress,
             "lastRun": to_run(s.last_run) if s.last_run else None,

@@ -11,7 +11,9 @@ from typing import Any
 from openai import OpenAI
 
 
-AI_RESULT_FIELDS = ["is_target_supplier", "confidence", "ai_reason", "ai_target_keywords"]
+# AI filtering is disabled; do not append AI result columns to generated CSVs.
+# AI_RESULT_FIELDS = ["is_target_supplier", "confidence", "ai_reason", "ai_target_keywords"]
+AI_RESULT_FIELDS: list[str] = []
 
 
 def load_env_file(path: str = ".env") -> None:

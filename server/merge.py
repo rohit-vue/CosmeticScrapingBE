@@ -10,12 +10,13 @@ from .registry import SCRAPERS, ScraperDef
 # Unified output schema. Every cleaned CSV (per-scraper and combined) is
 # guaranteed to contain exactly these columns in this order.
 COMBINED_COLUMNS = [
-    "source_directory",
     "company_name",
-    "country",
     "website_url",
+    "country",
     "email",
+    "source_directory",
     "profile_url",
+    "company_description",
 ]
 
 
@@ -50,7 +51,7 @@ def _normalize(df: pd.DataFrame, source_directory: str) -> pd.DataFrame:
     # Stamp source_directory consistently so combined output is always traceable.
     out["source_directory"] = source_directory
 
-    for col in ("company_name", "country", "website_url", "email", "profile_url"):
+    for col in ("company_name", "website_url", "country", "email", "source_directory", "profile_url", "company_description"):
         out[col] = out[col].fillna("").astype(str).str.strip()
 
     email_lower = out["email"].str.lower()

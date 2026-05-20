@@ -33,6 +33,8 @@ class ScraperState:
     output_csv: str
     keywords: list[str]
     countries: list[str]
+    manual_keywords: list[str] | None = None
+    manual_countries: list[str] | None = None
     status: ScraperStatus = "idle"
     progress: int = 0
     last_run: RunSummary | None = None

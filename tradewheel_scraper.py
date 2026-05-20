@@ -131,7 +131,7 @@ PAUSE_FOR_MANUAL_LOGIN = True
 AUTH_BROWSER_PROFILE_DIR = ".tradewheel_auth_profile"
 AUTH_BROWSER_HEADLESS = False
 MAX_LOGGED_IN_ENRICHMENTS = 0
-PLAYWRIGHT_AUTH_CHANNEL = "msedge"
+PLAYWRIGHT_AUTH_CHANNEL = "chrome"
 PLAYWRIGHT_AUTH_EXTRA_ARGS = ["--disable-blink-features=AutomationControlled"]
 TRADEWHEEL_EMAIL_ENV = "TRADEWHEEL_EMAIL"
 TRADEWHEEL_PASSWORD_ENV = "TRADEWHEEL_PASSWORD"
@@ -162,7 +162,7 @@ SEARCH_BROWSER_TIMEOUT_SECONDS = 45
 SEARCH_CLOUDFLARE_WAIT_SECONDS = env_int("TRADEWHEEL_CF_WAIT_SECONDS", 90)
 SEARCH_CLOUDFLARE_POLL_SECONDS = env_int("TRADEWHEEL_CF_POLL_SECONDS", 3)
 SEARCH_INVALID_WAIT_SECONDS = env_int("TRADEWHEEL_INVALID_WAIT_SECONDS", 15)
-PLAYWRIGHT_SEARCH_CHANNEL = "msedge"
+PLAYWRIGHT_SEARCH_CHANNEL = "chrome"
 PLAYWRIGHT_SEARCH_EXTRA_ARGS = ["--disable-blink-features=AutomationControlled"]
 
 # WEBSITE EMAIL ENRICHMENT (UPGRADED - requests-based, same as EC21/MIC)
@@ -420,10 +420,11 @@ class SupplierRecord:
     source_directory: str = SOURCE_DIRECTORY
     profile_url: str = ""
     company_description: str = ""
-    is_target_supplier: bool = False
-    confidence: float = 0.0
-    ai_reason: str = ""
-    ai_target_keywords: str = ""
+    # AI filtering is disabled; keep output CSVs free of AI result columns.
+    # is_target_supplier: bool = False
+    # confidence: float = 0.0
+    # ai_reason: str = ""
+    # ai_target_keywords: str = ""
 
 
 def random_delay():
@@ -1546,10 +1547,6 @@ def load_records_from_checkpoint(path: str) -> list[SupplierRecord]:
                 source_directory=_csv_text(row.get("source_directory")) or SOURCE_DIRECTORY,
                 profile_url=_csv_text(row.get("profile_url")),
                 company_description=_csv_text(row.get("company_description")),
-                is_target_supplier=_csv_bool(row.get("is_target_supplier")),
-                confidence=_csv_float(row.get("confidence")),
-                ai_reason=_csv_text(row.get("ai_reason")),
-                ai_target_keywords=_csv_text(row.get("ai_target_keywords")),
             )
         )
     return records

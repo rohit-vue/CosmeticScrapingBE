@@ -130,7 +130,8 @@ PERMANENT_FILTERS = {
 USE_BROWSER_FOR_SEARCH = True
 SEARCH_BROWSER_HEADLESS = False
 SEARCH_BROWSER_TIMEOUT_SECONDS = 60
-PLAYWRIGHT_CHANNEL = "msedge"
+ENSUN_PROFILE_DIR = ".ensun_playwright_profile"
+PLAYWRIGHT_CHANNEL = "chrome"
 PLAYWRIGHT_EXTRA_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--disable-features=IsolateOrigins,site-per-process",
@@ -215,10 +216,11 @@ class SupplierRecord:
     source_directory: str = SOURCE_DIRECTORY
     profile_url: str = ""
     company_description: str = ""
-    is_target_supplier: bool = False
-    confidence: float = 0.0
-    ai_reason: str = ""
-    ai_target_keywords: str = ""
+    # AI filtering is disabled; keep output CSVs free of AI result columns.
+    # is_target_supplier: bool = False
+    # confidence: float = 0.0
+    # ai_reason: str = ""
+    # ai_target_keywords: str = ""
 
 
 def random_delay():
@@ -341,17 +343,23 @@ class EnsunBrowser:
         print("[BROWSER] Launching Playwright browser...")
         self.playwright = sync_playwright().start()
         launch_kwargs = dict(
+            user_data_dir=str(Path(ENSUN_PROFILE_DIR).resolve()),
             headless=SEARCH_BROWSER_HEADLESS,
+            viewport={"width": 1366, "height": 768},
+            locale="en-US",
+            timezone_id="Asia/Shanghai",
             args=PLAYWRIGHT_EXTRA_ARGS,
         )
         if PLAYWRIGHT_CHANNEL:
             launch_kwargs["channel"] = PLAYWRIGHT_CHANNEL
-        self.browser = self.playwright.chromium.launch(**launch_kwargs)
-        self.context = self.browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            locale="en-US",
-            timezone_id="Asia/Shanghai",
-        )
+        try:
+            self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as exc:
+            if launch_kwargs.pop("channel", None):
+                print(f"[BROWSER][WARN] Could not launch channel '{PLAYWRIGHT_CHANNEL}': {exc}")
+                self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+            else:
+                raise
         self.page = self.context.new_page()
         self.page.set_extra_http_headers({
             "Accept-Language": "en-US,en;q=0.9",

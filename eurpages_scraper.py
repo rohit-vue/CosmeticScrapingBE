@@ -168,6 +168,7 @@ TARGET_SUPPLIERS = env_int("SCRAPER_TARGET_SUPPLIERS", TARGET_SUPPLIERS)
 EUROPAGES_PROFILE_DIR = ".europages_playwright_profile"
 BROWSER_TIMEOUT_MS = 120000
 PLAYWRIGHT_HEADLESS = False
+PLAYWRIGHT_CHANNEL = "chrome"
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -202,10 +203,11 @@ class SupplierRecord:
     source_directory: str = SOURCE_DIRECTORY
     profile_url: str = ""
     company_description: str = ""
-    is_target_supplier: bool = False
-    confidence: float = 0.0
-    ai_reason: str = ""
-    ai_target_keywords: str = ""
+    # AI filtering is disabled; keep output CSVs free of AI result columns.
+    # is_target_supplier: bool = False
+    # confidence: float = 0.0
+    # ai_reason: str = ""
+    # ai_target_keywords: str = ""
 
 
 def build_search_url(keyword: str, country_code: str, page: int) -> str:
@@ -410,7 +412,7 @@ class EuropagesScraper:
         
         user_data = str(Path(EUROPAGES_PROFILE_DIR).resolve())
         
-        self.context = self.playwright.chromium.launch_persistent_context(
+        launch_kwargs = dict(
             user_data_dir=user_data,
             headless=PLAYWRIGHT_HEADLESS,
             viewport={"width": 1366, "height": 768},
@@ -418,6 +420,16 @@ class EuropagesScraper:
             timezone_id="Europe/London",
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
         )
+        if PLAYWRIGHT_CHANNEL:
+            launch_kwargs["channel"] = PLAYWRIGHT_CHANNEL
+        try:
+            self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as exc:
+            if launch_kwargs.pop("channel", None):
+                print(f"  [BROWSER][WARN] Could not launch channel '{PLAYWRIGHT_CHANNEL}': {exc}")
+                self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+            else:
+                raise
         
         self.page = self.context.new_page()
         self.page.set_default_navigation_timeout(BROWSER_TIMEOUT_MS)

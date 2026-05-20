@@ -19,5 +19,9 @@ Thumbs.db
 .mic_contact_playwright_profile/
 .tradewheel_search_profile/
 .europages_playwright_profile/
+.ensun_playwright_profile/
+.exportpages_playwright_profile/
+.kompass_playwright_profile/
+.kompass_profile_playwright_profile/
 .tradewheel_country_probe_profile/
 runs/
