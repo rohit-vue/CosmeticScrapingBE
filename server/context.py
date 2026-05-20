@@ -37,6 +37,7 @@ class ScraperState:
     manual_countries: list[str] | None = None
     status: ScraperStatus = "idle"
     progress: int = 0
+    active_run_id: str | None = None
     last_run: RunSummary | None = None
     recent_runs: list[RunSummary] = field(default_factory=list)
 

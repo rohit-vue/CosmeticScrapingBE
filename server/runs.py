@@ -167,7 +167,7 @@ class RunManager:
                     and sid not in active_procs_alive
                     and self.states[sid].status in {"succeeded", "failed", "stopped"}
                 ]
-                if restartable_ids:
+                if restartable_ids and not active_procs_alive:
                     ids = restartable_ids
                     run_id = str(uuid4())
                     self.active_run = RunRecord(
@@ -187,6 +187,7 @@ class RunManager:
                             self.states[sid].countries = list(run_countries)
                         self.states[sid].status = "queued"
                         self.states[sid].progress = 0
+                        self.states[sid].active_run_id = run_id
                     self._executor.submit(
                         self._execute_run,
                         run_id,
@@ -220,6 +221,7 @@ class RunManager:
                         self.states[sid].countries = list(run_countries)
                     self.states[sid].status = "queued"
                     self.states[sid].progress = 0
+                    self.states[sid].active_run_id = run_id
                 self._executor.submit(
                     self._execute_run,
                     run_id,
@@ -247,6 +249,7 @@ class RunManager:
                     self.states[sid].countries = list(run_countries)
                 self.states[sid].status = "queued"
                 self.states[sid].progress = 0
+                self.states[sid].active_run_id = run_id
             self._executor.submit(
                 self._execute_run,
                 run_id,
@@ -260,6 +263,19 @@ class RunManager:
     def stop_run(self, run_id: str, scraper_ids: list[str] | None = None) -> None:
         with self._lock:
             if not self.active_run or self.active_run.run_id != run_id:
+                target_ids = scraper_ids or [
+                    sid
+                    for sid, state in self.states.items()
+                    if state.active_run_id == run_id
+                ]
+                for sid in target_ids:
+                    if sid not in self.states or self.states[sid].active_run_id != run_id:
+                        continue
+                    proc = self._active_procs.get(sid)
+                    if proc and proc.poll() is None:
+                        self._stop_requested.add(sid)
+                        self._terminate_process_tree(run_id, sid, proc)
+                        self.logs.emit(run_id, sid, "warn", "Stop requested by user")
                 return
             target_ids = scraper_ids or list(self._active_procs.keys())
             for sid in target_ids:
@@ -272,6 +288,7 @@ class RunManager:
                     self._stop_requested.add(sid)
                     self.states[sid].status = "stopped"
                     self.states[sid].progress = 0
+                    self.states[sid].active_run_id = None
                     self.logs.emit(run_id, sid, "warn", "Queued scraper stopped by user")
 
     def snapshot(self) -> dict[str, object]:
@@ -318,6 +335,7 @@ class RunManager:
                     )
                     state = self.states[scraper_id]
                     state.progress = 0
+                    state.active_run_id = None
                     state.last_run = summary
                     state.recent_runs = [summary, *state.recent_runs][:8]
                     self._stop_requested.discard(scraper_id)
@@ -325,6 +343,7 @@ class RunManager:
                     return scraper_id, summary
                 self.states[scraper_id].status = "running"
                 self.states[scraper_id].progress = 5
+                self.states[scraper_id].active_run_id = run_id
 
             # Use same interpreter as the API process (venv), not bare "python" on PATH.
             # `-X utf8` forces UTF-8 mode for stdio so scrapers can print Unicode (e.g. arrows, accents)
@@ -470,6 +489,7 @@ class RunManager:
                 else:
                     state.status = "failed"
                     state.progress = 0
+                state.active_run_id = None
                 self._stop_requested.discard(scraper_id)
                 state.last_run = summary
                 state.recent_runs = [summary, *state.recent_runs][:8]
@@ -556,6 +576,7 @@ class RunManager:
             manual_countries=list(s.manual_countries) if s.manual_countries else None,
             status=s.status,
             progress=s.progress,
+            active_run_id=s.active_run_id,
             last_run=s.last_run,
             recent_runs=list(s.recent_runs),
         )
@@ -587,6 +608,7 @@ class RunManager:
             "manualCountries": s.manual_countries,
             "status": s.status,
             "progress": s.progress,
+            "activeRunId": s.active_run_id,
             "lastRun": to_run(s.last_run) if s.last_run else None,
             "recentRuns": [to_run(r) for r in s.recent_runs],
         }
