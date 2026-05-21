@@ -25,3 +25,7 @@ Thumbs.db
 .kompass_profile_playwright_profile/
 .tradewheel_country_probe_profile/
 runs/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
